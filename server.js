@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -12,12 +13,18 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fxpro_secret_2025';
 
+// ---- NOWPayments config ----
+const NOWPAYMENTS_API_KEY = process.env.NOWPAYMENTS_API_KEY;
+const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET;
+const BACKEND_URL = process.env.BACKEND_URL || 'https://web-production-079d9.up.railway.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://fxproinvestment.com';
+
 // ---- PostgreSQL connection ----
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-// ---- Create tables on startup (runs once, safe to re-run) ----
+// ---- Create tables on startup (safe to re-run) ----
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -44,10 +51,19 @@ async function initDb() {
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id         TEXT PRIMARY KEY,
+      user_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
+      amount     NUMERIC,
+      status     TEXT DEFAULT 'waiting',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
   console.log('Database tables ready');
 }
 
-// ---- Helpers to shape data like the old in-memory format ----
+// ---- Helpers ----
 function shapePackage(row) {
   return {
     id: row.id,
@@ -79,6 +95,18 @@ async function getUserWithPackages(userId) {
     packages: pkgs.rows.map(shapePackage),
     createdAt: user.created_at,
   };
+}
+
+// Sort object keys recursively (needed for NOWPayments IPN signature)
+function sortObject(obj) {
+  if (Array.isArray(obj)) return obj.map(sortObject);
+  if (obj && typeof obj === 'object') {
+    return Object.keys(obj).sort().reduce((acc, key) => {
+      acc[key] = sortObject(obj[key]);
+      return acc;
+    }, {});
+  }
+  return obj;
 }
 
 // ---- Register ----
@@ -139,7 +167,7 @@ app.get('/api/profile', auth, async (req, res) => {
   }
 });
 
-// ---- Add package (invest) ----
+// ---- Add package directly (kept for compatibility) ----
 app.post('/api/invest', auth, async (req, res) => {
   try {
     const { amount } = req.body;
@@ -157,6 +185,94 @@ app.post('/api/invest', auth, async (req, res) => {
       message: 'Package added',
       package: { id: pkgId, amount, dailyProfit: 0, totalProfit: 0, active: true },
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Create a USDT payment for a package (NOWPayments) ----
+app.post('/api/payment/create', auth, async (req, res) => {
+  try {
+    const { amount } = req.body;
+    const validAmounts = [100, 250, 500, 1000, 2000, 5000, 10000, 25000];
+    if (!validAmounts.includes(amount))
+      return res.status(400).json({ error: 'Invalid package amount' });
+    if (!NOWPAYMENTS_API_KEY)
+      return res.status(500).json({ error: 'Payment not configured' });
+
+    const orderId = 'ORD' + Date.now() + Math.floor(Math.random() * 1000);
+
+    // Save a pending payment record
+    await pool.query(
+      `INSERT INTO payments (id, user_id, amount, status) VALUES ($1,$2,$3,'waiting')`,
+      [orderId, req.userId, amount]
+    );
+
+    // Create hosted invoice at NOWPayments
+    const npRes = await fetch('https://api.nowpayments.io/v1/invoice', {
+      method: 'POST',
+      headers: {
+        'x-api-key': NOWPAYMENTS_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        price_amount: amount,
+        price_currency: 'usd',
+        order_id: orderId,
+        order_description: `FX Pro Investment package $${amount}`,
+        ipn_callback_url: `${BACKEND_URL}/api/payment/webhook`,
+        success_url: `${FRONTEND_URL}/?paid=1`,
+        cancel_url: `${FRONTEND_URL}/?cancelled=1`,
+      }),
+    });
+
+    const data = await npRes.json();
+    if (!npRes.ok || !data.invoice_url) {
+      console.error('NOWPayments error:', data);
+      return res.status(502).json({ error: 'Could not create payment', details: data });
+    }
+
+    res.json({ payment_url: data.invoice_url, order_id: orderId });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- NOWPayments IPN webhook (payment status updates) ----
+app.post('/api/payment/webhook', async (req, res) => {
+  try {
+    const sig = req.headers['x-nowpayments-sig'];
+    if (!NOWPAYMENTS_IPN_SECRET || !sig)
+      return res.status(401).json({ error: 'Missing signature' });
+
+    const hmac = crypto.createHmac('sha512', NOWPAYMENTS_IPN_SECRET);
+    hmac.update(JSON.stringify(sortObject(req.body)));
+    const digest = hmac.digest('hex');
+    if (digest !== sig)
+      return res.status(401).json({ error: 'Invalid signature' });
+
+    const { order_id, payment_status } = req.body;
+
+    if (payment_status === 'finished' || payment_status === 'confirmed') {
+      const p = await pool.query('SELECT * FROM payments WHERE id = $1', [order_id]);
+      if (p.rows.length && p.rows[0].status !== 'finished') {
+        const pay = p.rows[0];
+        const pkgId = Date.now().toString();
+        await pool.query(
+          `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active)
+           VALUES ($1,$2,$3,0,0,TRUE)`,
+          [pkgId, pay.user_id, pay.amount]
+        );
+        await pool.query('UPDATE payments SET status = $1 WHERE id = $2', ['finished', order_id]);
+        console.log(`Payment ${order_id} finished, package activated for user ${pay.user_id}`);
+      }
+    } else if (order_id) {
+      await pool.query('UPDATE payments SET status = $1 WHERE id = $2', [payment_status, order_id]);
+    }
+
+    res.json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
