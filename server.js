@@ -60,6 +60,9 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id TEXT;`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS pay_address TEXT;`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS pay_amount TEXT;`);
   console.log('Database tables ready');
 }
 
@@ -209,8 +212,8 @@ app.post('/api/payment/create', auth, async (req, res) => {
       [orderId, req.userId, amount]
     );
 
-    // Create hosted invoice at NOWPayments
-    const npRes = await fetch('https://api.nowpayments.io/v1/invoice', {
+    // Create a payment (returns a USDT-ERC20 address to show on our own site)
+    const npRes = await fetch('https://api.nowpayments.io/v1/payment', {
       method: 'POST',
       headers: {
         'x-api-key': NOWPAYMENTS_API_KEY,
@@ -219,21 +222,50 @@ app.post('/api/payment/create', auth, async (req, res) => {
       body: JSON.stringify({
         price_amount: amount,
         price_currency: 'usd',
+        pay_currency: 'usdterc20',
         order_id: orderId,
         order_description: `FX Pro Investment package $${amount}`,
         ipn_callback_url: `${BACKEND_URL}/api/payment/webhook`,
-        success_url: `${FRONTEND_URL}/?paid=1`,
-        cancel_url: `${FRONTEND_URL}/?cancelled=1`,
       }),
     });
 
     const data = await npRes.json();
-    if (!npRes.ok || !data.invoice_url) {
+    if (!npRes.ok || !data.pay_address) {
       console.error('NOWPayments error:', data);
       return res.status(502).json({ error: 'Could not create payment', details: data });
     }
 
-    res.json({ payment_url: data.invoice_url, order_id: orderId });
+    // Store the NOWPayments payment details
+    await pool.query(
+      `UPDATE payments SET payment_id = $1, pay_address = $2, pay_amount = $3 WHERE id = $4`,
+      [String(data.payment_id), data.pay_address, String(data.pay_amount), orderId]
+    );
+
+    res.json({
+      order_id: orderId,
+      payment_id: data.payment_id,
+      pay_address: data.pay_address,
+      pay_amount: data.pay_amount,
+      pay_currency: data.pay_currency, // usdterc20
+      price_amount: amount,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Check payment status (frontend polls this) ----
+app.get('/api/payment/status', auth, async (req, res) => {
+  try {
+    const { order_id } = req.query;
+    if (!order_id) return res.status(400).json({ error: 'Missing order_id' });
+    const r = await pool.query(
+      'SELECT status FROM payments WHERE id = $1 AND user_id = $2',
+      [order_id, req.userId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ status: r.rows[0].status });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
