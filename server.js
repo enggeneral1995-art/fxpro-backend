@@ -19,6 +19,10 @@ const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET;
 const BACKEND_URL = process.env.BACKEND_URL || 'https://web-production-079d9.up.railway.app';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://fxproinvestment.com';
 
+// ---- Resend (email) config ----
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const MAIL_FROM = 'FX Pro Investment <noreply@fxproinvestment.com>';
+
 // ---- PostgreSQL connection ----
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -73,6 +77,9 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  // Columns for password reset codes
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires TIMESTAMPTZ;`);
   console.log('Database tables ready');
 }
 
@@ -122,6 +129,33 @@ function sortObject(obj) {
   return obj;
 }
 
+// ---- Send an email via Resend ----
+async function sendEmail(to, subject, html) {
+  if (!RESEND_API_KEY) {
+    console.error('RESEND_API_KEY missing - cannot send email');
+    return false;
+  }
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from: MAIL_FROM, to: [to], subject, html }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      console.error('Resend error:', data);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error('sendEmail failed:', e);
+    return false;
+  }
+}
+
 // ---- Register ----
 app.post('/api/register', async (req, res) => {
   try {
@@ -162,6 +196,74 @@ app.post('/api/login', async (req, res) => {
       token,
       user: { id: user.id, name: user.name, email: user.email, referralCode: user.referral_code },
     });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Forgot password: send a 6-digit code by email ----
+app.post('/api/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    const r = await pool.query('SELECT id, name FROM users WHERE email = $1', [email]);
+
+    // Always respond the same way (do not reveal whether the email exists)
+    if (r.rows.length) {
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+      const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+      await pool.query(
+        'UPDATE users SET reset_code = $1, reset_expires = $2 WHERE email = $3',
+        [code, expires, email]
+      );
+
+      const html = `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px">
+          <h2 style="color:#0a1f44;margin:0 0 8px">FX Pro Investment</h2>
+          <p style="color:#333;font-size:15px">You requested to reset your password. Use the verification code below:</p>
+          <div style="font-size:32px;font-weight:bold;letter-spacing:6px;color:#0a1f44;text-align:center;padding:16px 0">${code}</div>
+          <p style="color:#666;font-size:13px">This code will expire in 15 minutes. If you did not request this, you can safely ignore this email.</p>
+        </div>`;
+      await sendEmail(email, 'Your FX Pro password reset code', html);
+    }
+
+    res.json({ message: 'If an account with that email exists, a reset code has been sent.' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Reset password: verify code + set new password ----
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword)
+      return res.status(400).json({ error: 'Email, code and new password are required' });
+    if (String(newPassword).length < 6)
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const r = await pool.query(
+      'SELECT reset_code, reset_expires FROM users WHERE email = $1',
+      [email]
+    );
+    if (!r.rows.length) return res.status(400).json({ error: 'Invalid code' });
+
+    const row = r.rows[0];
+    if (!row.reset_code || row.reset_code !== String(code).trim())
+      return res.status(400).json({ error: 'Invalid code' });
+    if (!row.reset_expires || new Date(row.reset_expires) < new Date())
+      return res.status(400).json({ error: 'Code has expired. Please request a new one.' });
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      'UPDATE users SET password = $1, reset_code = NULL, reset_expires = NULL WHERE email = $2',
+      [hash, email]
+    );
+
+    res.json({ message: 'Password has been reset successfully. You can now log in.' });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
