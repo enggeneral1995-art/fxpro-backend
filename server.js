@@ -23,6 +23,15 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'https://fxproinvestment.com';
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const MAIL_FROM = 'FX Pro Investment <noreply@fxproinvestment.com>';
 
+// ---- Referral config ----
+const REFERRAL_RATE = 0.07; // 7% commission on every referred deposit (single level)
+// Cumulative milestone rewards: reach N active referrals -> earn this one-time bonus
+const REFERRAL_MILESTONES = [
+  { count: 5, bonus: 50 },
+  { count: 10, bonus: 75 },
+  { count: 15, bonus: 150 },
+];
+
 // ---- PostgreSQL connection ----
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -80,6 +89,19 @@ async function initDb() {
   // Columns for password reset codes
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires TIMESTAMPTZ;`);
+  // Columns + table for referral commissions & milestone bonuses
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_earnings NUMERIC DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS milestone_bonus NUMERIC DEFAULT 0;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS referral_earnings (
+      id             TEXT PRIMARY KEY,
+      referrer_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
+      referred_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
+      deposit_amount NUMERIC,
+      commission     NUMERIC,
+      created_at     TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
   console.log('Database tables ready');
 }
 
@@ -95,6 +117,21 @@ function shapePackage(row) {
   };
 }
 
+// Count how many people a user has referred who have at least one package (active referrals)
+async function countActiveReferrals(client, userId) {
+  const uc = await client.query('SELECT referral_code FROM users WHERE id = $1', [userId]);
+  if (!uc.rows.length) return 0;
+  const code = uc.rows[0].referral_code;
+  const r = await client.query(
+    `SELECT COUNT(DISTINCT u.id) AS c
+     FROM users u
+     JOIN packages p ON p.user_id = u.id
+     WHERE u.referred_by = $1`,
+    [code]
+  );
+  return Number(r.rows[0].c || 0);
+}
+
 async function getUserWithPackages(userId) {
   const u = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
   if (!u.rows.length) return null;
@@ -102,6 +139,16 @@ async function getUserWithPackages(userId) {
   const pkgs = await pool.query(
     'SELECT * FROM packages WHERE user_id = $1 ORDER BY created_at ASC',
     [userId]
+  );
+  // Referral stats (referred_by stores the referrer's referral_code)
+  const invited = await pool.query(
+    'SELECT COUNT(*) AS c FROM users WHERE referred_by = $1',
+    [user.referral_code]
+  );
+  const activeRef = await pool.query(
+    `SELECT COUNT(DISTINCT u.id) AS c FROM users u
+     JOIN packages p ON p.user_id = u.id WHERE u.referred_by = $1`,
+    [user.referral_code]
   );
   return {
     id: user.id,
@@ -112,6 +159,10 @@ async function getUserWithPackages(userId) {
     referredBy: user.referred_by,
     balance: Number(user.balance),
     totalProfit: Number(user.total_profit),
+    referralEarnings: Number(user.referral_earnings || 0),
+    milestoneBonus: Number(user.milestone_bonus || 0),
+    invitedCount: Number(invited.rows[0].c || 0),
+    activeReferrals: Number(activeRef.rows[0].c || 0),
     packages: pkgs.rows.map(shapePackage),
     createdAt: user.created_at,
   };
@@ -156,6 +207,53 @@ async function sendEmail(to, subject, html) {
   }
 }
 
+// ---- Pay referral commission + milestone bonuses (inside a transaction) ----
+// Called when a referred user's deposit is confirmed.
+async function payReferral(client, referredUserId, depositAmount) {
+  // Find who referred this user (referred_by holds the referrer's referral_code)
+  const ru = await client.query('SELECT referred_by FROM users WHERE id = $1', [referredUserId]);
+  const referrerCode = ru.rows.length ? ru.rows[0].referred_by : null;
+  if (!referrerCode) return; // not referred by anyone
+
+  const rr = await client.query('SELECT id FROM users WHERE referral_code = $1', [referrerCode]);
+  if (!rr.rows.length) return; // referrer not found
+  const referrerId = rr.rows[0].id;
+  if (referrerId === referredUserId) return; // safety: no self-referral
+
+  // 1) 7% commission on this deposit -> balance + referral_earnings
+  const commission = Number(depositAmount) * REFERRAL_RATE;
+  const cid = 'RE' + Date.now() + Math.floor(Math.random() * 1000);
+  await client.query(
+    `INSERT INTO referral_earnings (id, referrer_id, referred_id, deposit_amount, commission)
+     VALUES ($1,$2,$3,$4,$5)`,
+    [cid, referrerId, referredUserId, depositAmount, commission]
+  );
+  await client.query(
+    'UPDATE users SET balance = balance + $1, referral_earnings = referral_earnings + $1 WHERE id = $2',
+    [commission, referrerId]
+  );
+
+  // 2) Milestone bonuses (cumulative, each paid once)
+  const activeCount = await countActiveReferrals(client, referrerId);
+  const paidRow = await client.query('SELECT milestone_bonus FROM users WHERE id = $1', [referrerId]);
+  const alreadyPaid = Number(paidRow.rows[0].milestone_bonus || 0);
+
+  let totalDue = 0;
+  for (const m of REFERRAL_MILESTONES) {
+    if (activeCount >= m.count) totalDue += m.bonus;
+  }
+  const toPay = totalDue - alreadyPaid;
+  if (toPay > 0) {
+    await client.query(
+      'UPDATE users SET balance = balance + $1, milestone_bonus = milestone_bonus + $1 WHERE id = $2',
+      [toPay, referrerId]
+    );
+    console.log(`Milestone bonus $${toPay} paid to referrer ${referrerId} (active refs: ${activeCount})`);
+  }
+
+  console.log(`Referral commission $${commission.toFixed(2)} paid to ${referrerId} for deposit ${depositAmount}`);
+}
+
 // ---- Register ----
 app.post('/api/register', async (req, res) => {
   try {
@@ -168,10 +266,17 @@ app.post('/api/register', async (req, res) => {
     const id = Date.now().toString();
     const refCode = 'REF' + Date.now();
 
+    // Only store referredBy if the referral code actually belongs to an existing user
+    let referredBy = null;
+    if (referralCode) {
+      const rc = await pool.query('SELECT id FROM users WHERE referral_code = $1', [referralCode]);
+      if (rc.rows.length) referredBy = referralCode;
+    }
+
     await pool.query(
       `INSERT INTO users (id, name, email, phone, password, referral_code, referred_by, balance, total_profit)
        VALUES ($1,$2,$3,$4,$5,$6,$7,0,0)`,
-      [id, name, email, phone, hash, refCode, referralCode || null]
+      [id, name, email, phone, hash, refCode, referredBy]
     );
 
     const token = jwt.sign({ id }, JWT_SECRET);
@@ -210,7 +315,6 @@ app.post('/api/forgot-password', async (req, res) => {
 
     const r = await pool.query('SELECT id, name FROM users WHERE email = $1', [email]);
 
-    // Always respond the same way (do not reveal whether the email exists)
     if (r.rows.length) {
       const code = Math.floor(100000 + Math.random() * 900000).toString();
       const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
@@ -282,6 +386,37 @@ app.get('/api/profile', auth, async (req, res) => {
   }
 });
 
+// ---- Leaderboard: top referrers by number of active referrals ----
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT u.name,
+             COUNT(DISTINCT ref.id) AS referrals,
+             COALESCE(u.referral_earnings, 0) + COALESCE(u.milestone_bonus, 0) AS earned
+      FROM users u
+      JOIN users ref ON ref.referred_by = u.referral_code
+      JOIN packages p ON p.user_id = ref.id
+      GROUP BY u.id, u.name, u.referral_earnings, u.milestone_bonus
+      ORDER BY referrals DESC, earned DESC
+      LIMIT 10
+    `);
+    res.json(r.rows.map((row, i) => {
+      const name = (row.name || 'User').trim();
+      const parts = name.split(' ');
+      const display = parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
+      return {
+        rank: i + 1,
+        name: display,
+        referrals: Number(row.referrals),
+        earned: Number(row.earned),
+      };
+    }));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ---- Add package directly (kept for compatibility) ----
 app.post('/api/invest', auth, async (req, res) => {
   try {
@@ -318,13 +453,11 @@ app.post('/api/payment/create', auth, async (req, res) => {
 
     const orderId = 'ORD' + Date.now() + Math.floor(Math.random() * 1000);
 
-    // Save a pending payment record
     await pool.query(
       `INSERT INTO payments (id, user_id, amount, status) VALUES ($1,$2,$3,'waiting')`,
       [orderId, req.userId, amount]
     );
 
-    // Create a payment (returns a USDT-ERC20 address to show on our own site)
     const npRes = await fetch('https://api.nowpayments.io/v1/payment', {
       method: 'POST',
       headers: {
@@ -347,7 +480,6 @@ app.post('/api/payment/create', auth, async (req, res) => {
       return res.status(502).json({ error: 'Could not create payment', details: data });
     }
 
-    // Store the NOWPayments payment details
     await pool.query(
       `UPDATE payments SET payment_id = $1, pay_address = $2, pay_amount = $3 WHERE id = $4`,
       [String(data.payment_id), data.pay_address, String(data.pay_amount), orderId]
@@ -358,7 +490,7 @@ app.post('/api/payment/create', auth, async (req, res) => {
       payment_id: data.payment_id,
       pay_address: data.pay_address,
       pay_amount: data.pay_amount,
-      pay_currency: data.pay_currency, // usdterc20
+      pay_currency: data.pay_currency,
       price_amount: amount,
     });
   } catch (e) {
@@ -400,17 +532,29 @@ app.post('/api/payment/webhook', async (req, res) => {
     const { order_id, payment_status } = req.body;
 
     if (payment_status === 'finished' || payment_status === 'confirmed') {
-      const p = await pool.query('SELECT * FROM payments WHERE id = $1', [order_id]);
-      if (p.rows.length && p.rows[0].status !== 'finished') {
-        const pay = p.rows[0];
-        const pkgId = Date.now().toString();
-        await pool.query(
-          `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active)
-           VALUES ($1,$2,$3,0,0,TRUE)`,
-          [pkgId, pay.user_id, pay.amount]
-        );
-        await pool.query('UPDATE payments SET status = $1 WHERE id = $2', ['finished', order_id]);
-        console.log(`Payment ${order_id} finished, package activated for user ${pay.user_id}`);
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const p = await client.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [order_id]);
+        if (p.rows.length && p.rows[0].status !== 'finished') {
+          const pay = p.rows[0];
+          const pkgId = Date.now().toString();
+          await client.query(
+            `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active)
+             VALUES ($1,$2,$3,0,0,TRUE)`,
+            [pkgId, pay.user_id, pay.amount]
+          );
+          await client.query('UPDATE payments SET status = $1 WHERE id = $2', ['finished', order_id]);
+          // Pay 7% referral commission + milestone bonuses to the referrer
+          await payReferral(client, pay.user_id, Number(pay.amount));
+          console.log(`Payment ${order_id} finished, package activated for user ${pay.user_id}`);
+        }
+        await client.query('COMMIT');
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
       }
     } else if (order_id) {
       await pool.query('UPDATE payments SET status = $1 WHERE id = $2', [payment_status, order_id]);
@@ -429,7 +573,7 @@ app.post('/api/admin/distribute', async (req, res) => {
     const { adminKey, rate } = req.body;
     if (adminKey !== process.env.ADMIN_KEY)
       return res.status(403).json({ error: 'Forbidden' });
-    if (rate < 1.70 || rate > 2.65)
+    if (rate < 1.30 || rate > 5.00)
       return res.status(400).json({ error: 'Invalid rate' });
 
     const client = await pool.connect();
@@ -487,7 +631,6 @@ app.post('/api/withdraw', auth, async (req, res) => {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      // hold the amount by deducting from balance now
       await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amt, req.userId]);
       await client.query(
         `INSERT INTO withdrawals (id, user_id, amount, address, status) VALUES ($1,$2,$3,$4,'pending')`,
@@ -574,7 +717,6 @@ app.post('/api/admin/withdraw/reject', async (req, res) => {
     try {
       await client.query('BEGIN');
       await client.query('UPDATE withdrawals SET status = $1 WHERE id = $2', ['rejected', id]);
-      // refund the held amount back to user balance
       await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2',
         [Number(r.rows[0].amount), r.rows[0].user_id]);
       await client.query('COMMIT');
