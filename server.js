@@ -25,12 +25,26 @@ const MAIL_FROM = 'FX Pro Investment <noreply@fxproinvestment.com>';
 
 // ---- Referral config ----
 const REFERRAL_RATE = 0.07; // 7% commission on every referred deposit (single level)
-// Cumulative milestone rewards: reach N active referrals -> earn this one-time bonus
 const REFERRAL_MILESTONES = [
   { count: 5, bonus: 50 },
   { count: 10, bonus: 75 },
   { count: 15, bonus: 150 },
 ];
+
+// ---- Package durations (in days) by amount ----
+const PACKAGE_DURATIONS = {
+  100: 175,
+  250: 182,
+  500: 190,
+  1000: 197,
+  2000: 205,
+  5000: 215,
+  10000: 230,
+  25000: 270,
+};
+function durationFor(amount) {
+  return PACKAGE_DURATIONS[Number(amount)] || 175;
+}
 
 // ---- PostgreSQL connection ----
 const pool = new Pool({
@@ -102,6 +116,9 @@ async function initDb() {
       created_at     TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  // Columns for package duration / days remaining
+  await pool.query(`ALTER TABLE packages ADD COLUMN IF NOT EXISTS duration_days INTEGER DEFAULT 175;`);
+  await pool.query(`ALTER TABLE packages ADD COLUMN IF NOT EXISTS days_left INTEGER DEFAULT 175;`);
   console.log('Database tables ready');
 }
 
@@ -114,10 +131,11 @@ function shapePackage(row) {
     totalProfit: Number(row.total_profit),
     createdAt: row.created_at,
     active: row.active,
+    durationDays: row.duration_days != null ? Number(row.duration_days) : durationFor(row.amount),
+    daysLeft: row.days_left != null ? Number(row.days_left) : durationFor(row.amount),
   };
 }
 
-// Count how many people a user has referred who have at least one package (active referrals)
 async function countActiveReferrals(client, userId) {
   const uc = await client.query('SELECT referral_code FROM users WHERE id = $1', [userId]);
   if (!uc.rows.length) return 0;
@@ -140,7 +158,6 @@ async function getUserWithPackages(userId) {
     'SELECT * FROM packages WHERE user_id = $1 ORDER BY created_at ASC',
     [userId]
   );
-  // Referral stats (referred_by stores the referrer's referral_code)
   const invited = await pool.query(
     'SELECT COUNT(*) AS c FROM users WHERE referred_by = $1',
     [user.referral_code]
@@ -168,7 +185,6 @@ async function getUserWithPackages(userId) {
   };
 }
 
-// Sort object keys recursively (needed for NOWPayments IPN signature)
 function sortObject(obj) {
   if (Array.isArray(obj)) return obj.map(sortObject);
   if (obj && typeof obj === 'object') {
@@ -208,19 +224,16 @@ async function sendEmail(to, subject, html) {
 }
 
 // ---- Pay referral commission + milestone bonuses (inside a transaction) ----
-// Called when a referred user's deposit is confirmed.
 async function payReferral(client, referredUserId, depositAmount) {
-  // Find who referred this user (referred_by holds the referrer's referral_code)
   const ru = await client.query('SELECT referred_by FROM users WHERE id = $1', [referredUserId]);
   const referrerCode = ru.rows.length ? ru.rows[0].referred_by : null;
-  if (!referrerCode) return; // not referred by anyone
+  if (!referrerCode) return;
 
   const rr = await client.query('SELECT id FROM users WHERE referral_code = $1', [referrerCode]);
-  if (!rr.rows.length) return; // referrer not found
+  if (!rr.rows.length) return;
   const referrerId = rr.rows[0].id;
-  if (referrerId === referredUserId) return; // safety: no self-referral
+  if (referrerId === referredUserId) return;
 
-  // 1) 7% commission on this deposit -> balance + referral_earnings
   const commission = Number(depositAmount) * REFERRAL_RATE;
   const cid = 'RE' + Date.now() + Math.floor(Math.random() * 1000);
   await client.query(
@@ -233,7 +246,6 @@ async function payReferral(client, referredUserId, depositAmount) {
     [commission, referrerId]
   );
 
-  // 2) Milestone bonuses (cumulative, each paid once)
   const activeCount = await countActiveReferrals(client, referrerId);
   const paidRow = await client.query('SELECT milestone_bonus FROM users WHERE id = $1', [referrerId]);
   const alreadyPaid = Number(paidRow.rows[0].milestone_bonus || 0);
@@ -266,7 +278,6 @@ app.post('/api/register', async (req, res) => {
     const id = Date.now().toString();
     const refCode = 'REF' + Date.now();
 
-    // Only store referredBy if the referral code actually belongs to an existing user
     let referredBy = null;
     if (referralCode) {
       const rc = await pool.query('SELECT id FROM users WHERE referral_code = $1', [referralCode]);
@@ -307,7 +318,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ---- Forgot password: send a 6-digit code by email ----
+// ---- Forgot password ----
 app.post('/api/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
@@ -317,7 +328,7 @@ app.post('/api/forgot-password', async (req, res) => {
 
     if (r.rows.length) {
       const code = Math.floor(100000 + Math.random() * 900000).toString();
-      const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+      const expires = new Date(Date.now() + 15 * 60 * 1000);
       await pool.query(
         'UPDATE users SET reset_code = $1, reset_expires = $2 WHERE email = $3',
         [code, expires, email]
@@ -340,7 +351,7 @@ app.post('/api/forgot-password', async (req, res) => {
   }
 });
 
-// ---- Reset password: verify code + set new password ----
+// ---- Reset password ----
 app.post('/api/reset-password', async (req, res) => {
   try {
     const { email, code, newPassword } = req.body;
@@ -386,7 +397,7 @@ app.get('/api/profile', auth, async (req, res) => {
   }
 });
 
-// ---- Leaderboard: top referrers by number of active referrals ----
+// ---- Leaderboard ----
 app.get('/api/leaderboard', async (req, res) => {
   try {
     const r = await pool.query(`
@@ -426,14 +437,15 @@ app.post('/api/invest', auth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid package amount' });
 
     const pkgId = Date.now().toString();
+    const dur = durationFor(amount);
     await pool.query(
-      `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active)
-       VALUES ($1,$2,$3,0,0,TRUE)`,
-      [pkgId, req.userId, amount]
+      `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active, duration_days, days_left)
+       VALUES ($1,$2,$3,0,0,TRUE,$4,$4)`,
+      [pkgId, req.userId, amount, dur]
     );
     res.json({
       message: 'Package added',
-      package: { id: pkgId, amount, dailyProfit: 0, totalProfit: 0, active: true },
+      package: { id: pkgId, amount, dailyProfit: 0, totalProfit: 0, active: true, durationDays: dur, daysLeft: dur },
     });
   } catch (e) {
     console.error(e);
@@ -499,7 +511,7 @@ app.post('/api/payment/create', auth, async (req, res) => {
   }
 });
 
-// ---- Check payment status (frontend polls this) ----
+// ---- Check payment status ----
 app.get('/api/payment/status', auth, async (req, res) => {
   try {
     const { order_id } = req.query;
@@ -516,7 +528,7 @@ app.get('/api/payment/status', auth, async (req, res) => {
   }
 });
 
-// ---- NOWPayments IPN webhook (payment status updates) ----
+// ---- NOWPayments IPN webhook ----
 app.post('/api/payment/webhook', async (req, res) => {
   try {
     const sig = req.headers['x-nowpayments-sig'];
@@ -539,13 +551,13 @@ app.post('/api/payment/webhook', async (req, res) => {
         if (p.rows.length && p.rows[0].status !== 'finished') {
           const pay = p.rows[0];
           const pkgId = Date.now().toString();
+          const dur = durationFor(pay.amount);
           await client.query(
-            `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active)
-             VALUES ($1,$2,$3,0,0,TRUE)`,
-            [pkgId, pay.user_id, pay.amount]
+            `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active, duration_days, days_left)
+             VALUES ($1,$2,$3,0,0,TRUE,$4,$4)`,
+            [pkgId, pay.user_id, pay.amount, dur]
           );
           await client.query('UPDATE payments SET status = $1 WHERE id = $2', ['finished', order_id]);
-          // Pay 7% referral commission + milestone bonuses to the referrer
           await payReferral(client, pay.user_id, Number(pay.amount));
           console.log(`Payment ${order_id} finished, package activated for user ${pay.user_id}`);
         }
@@ -568,6 +580,9 @@ app.post('/api/payment/webhook', async (req, res) => {
 });
 
 // ---- Distribute daily profit (admin) ----
+// Pays profit to active packages AND decreases days_left by 1 for ALL active
+// packages (counting every calendar day). Packages that reach 0 days are
+// automatically completed (active = FALSE).
 app.post('/api/admin/distribute', async (req, res) => {
   try {
     const { adminKey, rate } = req.body;
@@ -606,6 +621,43 @@ app.post('/api/admin/distribute', async (req, res) => {
   }
 });
 
+// ---- Advance one calendar day (admin): decrement days_left for all active
+// packages and mark completed ones. Run this ONCE per day (every day,
+// including weekends). Separate from profit so counting stays on all 7 days. ----
+app.post('/api/admin/tick-day', async (req, res) => {
+  try {
+    const { adminKey } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    const client = await pool.connect();
+    let completed = 0;
+    try {
+      await client.query('BEGIN');
+      // decrement, not below 0
+      await client.query(
+        `UPDATE packages SET days_left = GREATEST(days_left - 1, 0) WHERE active = TRUE`
+      );
+      // complete packages that hit 0
+      const done = await client.query(
+        `UPDATE packages SET active = FALSE WHERE active = TRUE AND days_left <= 0 RETURNING id`
+      );
+      completed = done.rows.length;
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ message: `Day advanced. ${completed} package(s) completed.` });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ---- Request a withdrawal (user) ----
 app.post('/api/withdraw', auth, async (req, res) => {
   try {
@@ -616,7 +668,6 @@ app.post('/api/withdraw', auth, async (req, res) => {
     if (!address || String(address).trim().length < 10)
       return res.status(400).json({ error: 'Please enter a valid USDT (ERC20) address' });
 
-    // Withdrawals only on Thursday (UTC). getUTCDay(): 0=Sun ... 4=Thu
     if (new Date().getUTCDay() !== 4)
       return res.status(400).json({ error: 'Withdrawals are only available on Thursdays (UTC).' });
 
