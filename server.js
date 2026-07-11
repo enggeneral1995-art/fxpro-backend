@@ -63,6 +63,16 @@ async function initDb() {
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id TEXT;`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS pay_address TEXT;`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS pay_amount TEXT;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS withdrawals (
+      id         TEXT PRIMARY KEY,
+      user_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
+      amount     NUMERIC,
+      address    TEXT,
+      status     TEXT DEFAULT 'pending',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
   console.log('Database tables ready');
 }
 
@@ -344,6 +354,136 @@ app.post('/api/admin/distribute', async (req, res) => {
     }
 
     res.json({ message: `Profit distributed at ${rate}%` });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Request a withdrawal (user) ----
+app.post('/api/withdraw', auth, async (req, res) => {
+  try {
+    const { amount, address } = req.body;
+    const amt = Number(amount);
+    if (!amt || amt < 30)
+      return res.status(400).json({ error: 'Minimum withdrawal is $30' });
+    if (!address || String(address).trim().length < 10)
+      return res.status(400).json({ error: 'Please enter a valid USDT (ERC20) address' });
+
+    // Withdrawals only on Thursday (UTC). getUTCDay(): 0=Sun ... 4=Thu
+    if (new Date().getUTCDay() !== 4)
+      return res.status(400).json({ error: 'Withdrawals are only available on Thursdays (UTC).' });
+
+    const u = await pool.query('SELECT balance FROM users WHERE id = $1', [req.userId]);
+    if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
+    const balance = Number(u.rows[0].balance);
+    if (amt > balance)
+      return res.status(400).json({ error: 'Amount exceeds your available balance' });
+
+    const wid = 'WD' + Date.now() + Math.floor(Math.random() * 1000);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // hold the amount by deducting from balance now
+      await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amt, req.userId]);
+      await client.query(
+        `INSERT INTO withdrawals (id, user_id, amount, address, status) VALUES ($1,$2,$3,$4,'pending')`,
+        [wid, req.userId, amt, String(address).trim()]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({
+      message: 'Your withdrawal request has been submitted. Please allow up to 48 hours for it to be processed.',
+      id: wid,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- List withdrawals (admin) ----
+app.get('/api/admin/withdrawals', async (req, res) => {
+  try {
+    const { adminKey } = req.query;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    const r = await pool.query(`
+      SELECT w.id, w.amount, w.address, w.status, w.created_at,
+             u.name AS user_name, u.email AS user_email
+      FROM withdrawals w
+      LEFT JOIN users u ON u.id = w.user_id
+      ORDER BY w.created_at DESC
+    `);
+    res.json(r.rows.map(row => ({
+      id: row.id,
+      amount: Number(row.amount),
+      address: row.address,
+      status: row.status,
+      createdAt: row.created_at,
+      userName: row.user_name,
+      userEmail: row.user_email,
+    })));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Approve a withdrawal (admin) ----
+app.post('/api/admin/withdraw/approve', async (req, res) => {
+  try {
+    const { adminKey, id } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+    const r = await pool.query('SELECT status FROM withdrawals WHERE id = $1', [id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+    if (r.rows[0].status !== 'pending')
+      return res.status(400).json({ error: 'Already processed' });
+    await pool.query('UPDATE withdrawals SET status = $1 WHERE id = $2', ['approved', id]);
+    res.json({ message: 'Withdrawal approved' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Reject a withdrawal (admin) -> refund balance ----
+app.post('/api/admin/withdraw/reject', async (req, res) => {
+  try {
+    const { adminKey, id } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    const r = await pool.query('SELECT user_id, amount, status FROM withdrawals WHERE id = $1', [id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Not found' });
+    if (r.rows[0].status !== 'pending')
+      return res.status(400).json({ error: 'Already processed' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('UPDATE withdrawals SET status = $1 WHERE id = $2', ['rejected', id]);
+      // refund the held amount back to user balance
+      await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2',
+        [Number(r.rows[0].amount), r.rows[0].user_id]);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ message: 'Withdrawal rejected and amount refunded' });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
