@@ -364,7 +364,7 @@ async function createPackage(client, userId, amount, isTest = false) {
   const r = await client.query(
     `INSERT INTO packages
        (id, user_id, amount, daily_profit, total_profit, active, duration_days, days_left, expires_at, is_test)
-     VALUES ($1,$2,$3,0,0,TRUE,$4,$4, NOW() + ($4 || ' days')::interval, $5)
+     VALUES ($1,$2,$3,0,0,TRUE,$4::int,$4::int, NOW() + ($4::int * INTERVAL '1 day'), $5)
      RETURNING *`,
     [pkgId, userId, amount, dur, isTest]
   );
@@ -598,8 +598,9 @@ app.post('/api/admin/grant-package', async (req, res) => {
       package: pkg,
     });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Server error' });
+    console.error('grant-package failed:', e);
+    // admin-only route, so it is safe (and much more useful) to return the real reason
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
   }
 });
 
