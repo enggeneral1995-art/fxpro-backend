@@ -129,6 +129,9 @@ async function initDb() {
   await pool.query(`ALTER TABLE packages ADD COLUMN IF NOT EXISTS days_left INTEGER DEFAULT 175;`);
   // NEW: the exact moment a package stops earning. This is the source of truth.
   await pool.query(`ALTER TABLE packages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`);
+  // Marks packages created by the admin for testing, so they can be told apart
+  // from real, paid packages and kept out of the public leaderboard.
+  await pool.query(`ALTER TABLE packages ADD COLUMN IF NOT EXISTS is_test BOOLEAN DEFAULT FALSE;`);
 
   // Backfill duration_days for old rows that were created before durations existed
   await pool.query(`
@@ -215,6 +218,7 @@ function shapePackage(row) {
     durationDays: duration,
     daysLeft: daysLeft,
     expiresAt: row.expires_at,
+    isTest: !!row.is_test,
     progress: duration > 0
       ? Math.min(100, Math.round(((duration - daysLeft) / duration) * 100))
       : 0,
@@ -354,15 +358,15 @@ async function payReferral(client, referredUserId, depositAmount) {
 }
 
 // ---- Create a package row (shared by /api/invest and the payment webhook) ----
-async function createPackage(client, userId, amount) {
+async function createPackage(client, userId, amount, isTest = false) {
   const pkgId = makeId('PK');
   const dur = durationFor(amount);
   const r = await client.query(
     `INSERT INTO packages
-       (id, user_id, amount, daily_profit, total_profit, active, duration_days, days_left, expires_at)
-     VALUES ($1,$2,$3,0,0,TRUE,$4,$4, NOW() + ($4 || ' days')::interval)
+       (id, user_id, amount, daily_profit, total_profit, active, duration_days, days_left, expires_at, is_test)
+     VALUES ($1,$2,$3,0,0,TRUE,$4,$4, NOW() + ($4 || ' days')::interval, $5)
      RETURNING *`,
-    [pkgId, userId, amount, dur]
+    [pkgId, userId, amount, dur, isTest]
   );
   return shapePackage(r.rows[0]);
 }
@@ -513,7 +517,7 @@ app.get('/api/leaderboard', async (req, res) => {
              COALESCE(u.referral_earnings, 0) + COALESCE(u.milestone_bonus, 0) AS earned
       FROM users u
       JOIN users ref ON ref.referred_by = u.referral_code
-      JOIN packages p ON p.user_id = ref.id
+      JOIN packages p ON p.user_id = ref.id AND p.is_test = FALSE
       GROUP BY u.id, u.name, u.referral_earnings, u.milestone_bonus
       ORDER BY referrals DESC, earned DESC
       LIMIT 10
@@ -535,15 +539,85 @@ app.get('/api/leaderboard', async (req, res) => {
   }
 });
 
-// ---- Add package directly (kept for compatibility) ----
-app.post('/api/invest', auth, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    if (!VALID_AMOUNTS.includes(Number(amount)))
-      return res.status(400).json({ error: 'Invalid package amount' });
+// ---- SECURITY: /api/invest is permanently disabled ----
+// This route used to create a package for any logged-in user without payment.
+// Anyone with an account could have called it from the browser console and
+// granted themselves a $25,000 package for free. Packages are now created in
+// exactly two places: the verified NOWPayments webhook, and the admin-only
+// grant route below.
+app.post('/api/invest', auth, (req, res) => {
+  console.warn(`Blocked /api/invest attempt by user ${req.userId}`);
+  return res.status(403).json({ error: 'Packages can only be created by completing a payment.' });
+});
 
-    const pkg = await createPackage(pool, req.userId, Number(amount));
-    res.json({ message: 'Package added', package: pkg });
+// ---- Grant a package manually (ADMIN ONLY) ----
+// Use this for your own testing, or to activate a package for a user who paid
+// outside NOWPayments. Requires ADMIN_KEY - a normal user cannot reach it.
+//
+// body: { adminKey, email, amount, isTest?, payReferral? }
+//   isTest      -> default true. Test packages are excluded from the leaderboard.
+//   payReferral -> default false. Set true to also pay the 7% referral commission.
+app.post('/api/admin/grant-package', async (req, res) => {
+  try {
+    const { adminKey, email, amount, isTest, payReferral: doRef } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    const amt = Number(amount);
+    if (!VALID_AMOUNTS.includes(amt))
+      return res.status(400).json({ error: 'Invalid package amount' });
+    if (!email)
+      return res.status(400).json({ error: 'Email is required' });
+
+    const u = await pool.query('SELECT id, name FROM users WHERE email = $1', [String(email).trim()]);
+    if (!u.rows.length)
+      return res.status(404).json({ error: 'No user with that email' });
+
+    const userId = u.rows[0].id;
+    const test = isTest === undefined ? true : !!isTest;
+
+    const client = await pool.connect();
+    let pkg;
+    try {
+      await client.query('BEGIN');
+      pkg = await createPackage(client, userId, amt, test);
+      if (doRef === true) {
+        await payReferral(client, userId, amt);
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    console.log(`ADMIN granted ${test ? 'TEST ' : ''}package $${amt} to ${email}`);
+    res.json({
+      message: `${test ? 'Test package' : 'Package'} of $${amt} granted to ${email}`,
+      package: pkg,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Delete a package (ADMIN ONLY) ----
+// Handy for cleaning up test packages when you are done.
+// This does NOT claw back profit already added to the user's balance.
+app.post('/api/admin/delete-package', async (req, res) => {
+  try {
+    const { adminKey, packageId } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+    if (!packageId) return res.status(400).json({ error: 'packageId is required' });
+
+    const r = await pool.query('DELETE FROM packages WHERE id = $1 RETURNING id, amount', [packageId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Package not found' });
+
+    console.log(`ADMIN deleted package ${packageId}`);
+    res.json({ message: `Package ${packageId} deleted` });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
