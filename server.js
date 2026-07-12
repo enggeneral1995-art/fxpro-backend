@@ -31,21 +31,48 @@ const REFERRAL_MILESTONES = [
   { count: 15, bonus: 150 },
 ];
 
-// ---- Package durations (in days) by amount ----
-const PACKAGE_DURATIONS = {
-  100: 175,
-  250: 182,
-  500: 190,
-  1000: 197,
-  2000: 205,
-  5000: 215,
-  10000: 230,
-  25000: 270,
-};
-const VALID_AMOUNTS = [100, 250, 500, 1000, 2000, 5000, 10000, 25000];
+// ---- Default package catalogue ----
+// These are only the seed values. Once the server has run once, the real
+// numbers live in the package_settings table and are edited from the admin panel.
+const DEFAULT_PACKAGES = [
+  { amount: 100,   min: 1.30, max: 2.00, days: 175 },
+  { amount: 250,   min: 1.50, max: 2.20, days: 182 },
+  { amount: 500,   min: 1.70, max: 2.40, days: 190 },
+  { amount: 1000,  min: 1.90, max: 2.60, days: 197 },
+  { amount: 2000,  min: 2.10, max: 2.80, days: 205 },
+  { amount: 5000,  min: 2.30, max: 3.00, days: 215 },
+  { amount: 10000, min: 2.40, max: 3.10, days: 230 },
+  { amount: 25000, min: 3.00, max: 5.00, days: 270 },
+];
+const VALID_AMOUNTS = DEFAULT_PACKAGES.map(p => p.amount);
+
+// In-memory cache of package_settings, refreshed whenever the admin saves.
+let PKG_SETTINGS = {};
+async function loadPackageSettings() {
+  const r = await pool.query('SELECT * FROM package_settings ORDER BY amount ASC');
+  const map = {};
+  for (const row of r.rows) {
+    map[Number(row.amount)] = {
+      amount: Number(row.amount),
+      minRate: Number(row.min_rate),
+      maxRate: Number(row.max_rate),
+      durationDays: Number(row.duration_days),
+      active: row.active !== false,
+    };
+  }
+  PKG_SETTINGS = map;
+  return map;
+}
+
+function settingsFor(amount) {
+  const a = Number(amount);
+  if (PKG_SETTINGS[a]) return PKG_SETTINGS[a];
+  const d = DEFAULT_PACKAGES.find(p => p.amount === a) || DEFAULT_PACKAGES[0];
+  return { amount: a, minRate: d.min, maxRate: d.max, durationDays: d.days, active: true };
+}
 
 function durationFor(amount) {
-  return PACKAGE_DURATIONS[Number(amount)] || 175;
+  return settingsFor(amount).durationDays;
 }
 
 // Unique id helper (avoids two packages colliding on the same millisecond)
@@ -159,6 +186,31 @@ async function initDb() {
   }
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_packages_active ON packages(active);`);
+
+  // ---- Package settings: the single source of truth for rates + durations ----
+  // Both the public site and the profit distribution read from here, so the
+  // admin panel can actually change what investors see and what they get paid.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS package_settings (
+      amount        INTEGER PRIMARY KEY,
+      min_rate      NUMERIC NOT NULL,
+      max_rate      NUMERIC NOT NULL,
+      duration_days INTEGER NOT NULL,
+      active        BOOLEAN DEFAULT TRUE,
+      updated_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // Seed the defaults once. ON CONFLICT DO NOTHING means your edits are never
+  // overwritten on the next deploy.
+  for (const d of DEFAULT_PACKAGES) {
+    await pool.query(
+      `INSERT INTO package_settings (amount, min_rate, max_rate, duration_days, active)
+       VALUES ($1,$2,$3,$4,TRUE)
+       ON CONFLICT (amount) DO NOTHING`,
+      [d.amount, d.min, d.max, d.days]
+    );
+  }
 
   console.log('Database tables ready');
 }
@@ -371,9 +423,81 @@ async function createPackage(client, userId, amount, isTest = false) {
   return shapePackage(r.rows[0]);
 }
 
-// ---- Public: package catalogue (amount + duration) ----
-app.get('/api/packages', (req, res) => {
-  res.json(VALID_AMOUNTS.map(a => ({ amount: a, durationDays: durationFor(a) })));
+// ---- Public: package catalogue (rates + durations) ----
+// index.html reads this on load, so whatever the admin saves is what investors see.
+app.get('/api/packages', async (req, res) => {
+  try {
+    const map = await loadPackageSettings();
+    const list = Object.values(map)
+      .filter(p => p.active)
+      .sort((a, b) => a.amount - b.amount)
+      .map(p => ({
+        amount: p.amount,
+        minRate: p.minRate,
+        maxRate: p.maxRate,
+        durationDays: p.durationDays,
+      }));
+    res.json(list);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Admin: read every package setting (including disabled ones) ----
+app.get('/api/admin/settings', async (req, res) => {
+  try {
+    const { adminKey } = req.query;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+    const map = await loadPackageSettings();
+    res.json(Object.values(map).sort((a, b) => a.amount - b.amount));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
+});
+
+// ---- Admin: update one package's rates / duration / visibility ----
+// body: { adminKey, amount, minRate, maxRate, durationDays, active }
+app.post('/api/admin/settings', async (req, res) => {
+  try {
+    const { adminKey, amount, minRate, maxRate, durationDays, active } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    const amt = Number(amount);
+    if (!VALID_AMOUNTS.includes(amt))
+      return res.status(400).json({ error: 'Invalid package amount' });
+
+    const min = Number(minRate);
+    const max = Number(maxRate);
+    const dur = Number(durationDays);
+
+    if (!isFinite(min) || !isFinite(max) || min <= 0 || max <= 0)
+      return res.status(400).json({ error: 'Rates must be positive numbers' });
+    if (min > max)
+      return res.status(400).json({ error: 'Min rate cannot be greater than max rate' });
+    if (max > 10)
+      return res.status(400).json({ error: 'Max daily rate above 10% is not allowed' });
+    if (!Number.isInteger(dur) || dur < 1 || dur > 1000)
+      return res.status(400).json({ error: 'Duration must be between 1 and 1000 days' });
+
+    await pool.query(
+      `UPDATE package_settings
+          SET min_rate = $2, max_rate = $3, duration_days = $4, active = $5, updated_at = NOW()
+        WHERE amount = $1`,
+      [amt, min, max, dur, active !== false]
+    );
+
+    await loadPackageSettings();
+    console.log(`ADMIN updated package $${amt}: ${min}%-${max}%, ${dur} days, active=${active !== false}`);
+
+    res.json({ message: `Package $${amt} updated`, setting: settingsFor(amt) });
+  } catch (e) {
+    console.error('settings update failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
 });
 
 // ---- Register ----
@@ -757,14 +881,26 @@ app.post('/api/admin/distribute', async (req, res) => {
     if (adminKey !== process.env.ADMIN_KEY)
       return res.status(403).json({ error: 'Forbidden' });
 
-    const r = Number(rate);
-    if (!isFinite(r) || r < 1.30 || r > 5.00)
-      return res.status(400).json({ error: 'Invalid rate' });
+    // `rate` is a percentage of each package's own min-max band:
+    //   0   = pay everyone their minimum rate
+    //   100 = pay everyone their maximum rate
+    //   50  = pay the middle of each band
+    // Omit `rate` entirely and each package gets a random value inside its band.
+    // Either way, a $100 package can never be paid a $25,000 package's rate.
+    await loadPackageSettings();
+
+    let position = null;
+    if (rate !== undefined && rate !== null && rate !== '') {
+      position = Number(rate);
+      if (!isFinite(position) || position < 0 || position > 100)
+        return res.status(400).json({ error: 'Rate position must be between 0 and 100' });
+    }
 
     const client = await pool.connect();
     let paidCount = 0;
     let completedCount = 0;
     let totalPaid = 0;
+    const breakdown = {};
     try {
       await client.query('BEGIN');
 
@@ -780,7 +916,15 @@ app.post('/api/admin/distribute', async (req, res) => {
       );
 
       for (const pkg of pkgs.rows) {
+        const cfg = settingsFor(pkg.amount);
+        const span = cfg.maxRate - cfg.minRate;
+
+        // pick this package's rate from its OWN band
+        const frac = position !== null ? (position / 100) : Math.random();
+        const r = cfg.minRate + span * frac;
+
         const profit = (Number(pkg.amount) * r) / 100;
+
         await client.query(
           'UPDATE packages SET daily_profit = $1, total_profit = total_profit + $1 WHERE id = $2',
           [profit, pkg.id]
@@ -789,8 +933,12 @@ app.post('/api/admin/distribute', async (req, res) => {
           'UPDATE users SET balance = balance + $1, total_profit = total_profit + $1 WHERE id = $2',
           [profit, pkg.user_id]
         );
+
         paidCount++;
         totalPaid += profit;
+        const key = '$' + Number(pkg.amount);
+        breakdown[key] = breakdown[key] || { count: 0, rate: Number(r.toFixed(3)) };
+        breakdown[key].count++;
       }
 
       // 3) refresh the display counter
@@ -805,10 +953,13 @@ app.post('/api/admin/distribute', async (req, res) => {
     }
 
     res.json({
-      message: `Profit distributed at ${r}%`,
+      message: position !== null
+        ? `Profit distributed at ${position}% of each package's range`
+        : `Profit distributed at a random rate inside each package's range`,
       packagesPaid: paidCount,
       packagesCompleted: completedCount,
       totalPaid: Number(totalPaid.toFixed(2)),
+      breakdown,
     });
   } catch (e) {
     console.error(e);
@@ -1042,6 +1193,7 @@ function startExpiryJob() {
 
 // ---- Start server after DB is ready ----
 initDb()
+  .then(() => loadPackageSettings())
   .then(() => {
     startExpiryJob();
     app.listen(PORT, () => console.log(`FX Pro server running on port ${PORT}`));
