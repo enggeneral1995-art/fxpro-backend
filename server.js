@@ -42,8 +42,15 @@ const PACKAGE_DURATIONS = {
   10000: 230,
   25000: 270,
 };
+const VALID_AMOUNTS = [100, 250, 500, 1000, 2000, 5000, 10000, 25000];
+
 function durationFor(amount) {
   return PACKAGE_DURATIONS[Number(amount)] || 175;
+}
+
+// Unique id helper (avoids two packages colliding on the same millisecond)
+function makeId(prefix) {
+  return prefix + Date.now().toString(36) + crypto.randomBytes(4).toString('hex');
 }
 
 // ---- PostgreSQL connection ----
@@ -116,23 +123,101 @@ async function initDb() {
       created_at     TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-  // Columns for package duration / days remaining
+
+  // ---- Package duration columns ----
   await pool.query(`ALTER TABLE packages ADD COLUMN IF NOT EXISTS duration_days INTEGER DEFAULT 175;`);
   await pool.query(`ALTER TABLE packages ADD COLUMN IF NOT EXISTS days_left INTEGER DEFAULT 175;`);
+  // NEW: the exact moment a package stops earning. This is the source of truth.
+  await pool.query(`ALTER TABLE packages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;`);
+
+  // Backfill duration_days for old rows that were created before durations existed
+  await pool.query(`
+    UPDATE packages SET duration_days = CASE
+      WHEN amount >= 25000 THEN 270
+      WHEN amount >= 10000 THEN 230
+      WHEN amount >= 5000  THEN 215
+      WHEN amount >= 2000  THEN 205
+      WHEN amount >= 1000  THEN 197
+      WHEN amount >= 500   THEN 190
+      WHEN amount >= 250   THEN 182
+      ELSE 175 END
+    WHERE duration_days IS NULL;
+  `);
+
+  // Backfill expires_at = created_at + duration_days for any package missing it
+  const back = await pool.query(`
+    UPDATE packages
+       SET expires_at = created_at + (COALESCE(duration_days, 175) || ' days')::interval
+     WHERE expires_at IS NULL
+    RETURNING id;
+  `);
+  if (back.rows.length) {
+    console.log(`Backfilled expires_at for ${back.rows.length} existing package(s)`);
+  }
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_packages_active ON packages(active);`);
+
   console.log('Database tables ready');
 }
 
+// ---- Expire any package whose end date has passed ----
+// Safe to call as often as we like. This is what makes durations reliable:
+// nothing depends on an admin remembering to click a button every day.
+async function expireDuePackages(client) {
+  const q = client || pool;
+  const done = await q.query(`
+    UPDATE packages
+       SET active = FALSE, days_left = 0, daily_profit = 0
+     WHERE active = TRUE AND expires_at IS NOT NULL AND expires_at <= NOW()
+    RETURNING id, user_id, amount;
+  `);
+  if (done.rows.length) {
+    for (const r of done.rows) {
+      console.log(`Package ${r.id} ($${r.amount}) completed for user ${r.user_id}`);
+    }
+  }
+  return done.rows.length;
+}
+
+// ---- Keep days_left in sync with expires_at (display only) ----
+async function syncDaysLeft(client) {
+  const q = client || pool;
+  await q.query(`
+    UPDATE packages
+       SET days_left = GREATEST(0, CEIL(EXTRACT(EPOCH FROM (expires_at - NOW())) / 86400))
+     WHERE active = TRUE AND expires_at IS NOT NULL;
+  `);
+}
+
 // ---- Helpers ----
+function daysLeftFrom(expiresAt) {
+  if (!expiresAt) return null;
+  const ms = new Date(expiresAt).getTime() - Date.now();
+  if (ms <= 0) return 0;
+  return Math.ceil(ms / 86400000);
+}
+
 function shapePackage(row) {
+  const duration = row.duration_days != null ? Number(row.duration_days) : durationFor(row.amount);
+  const computed = daysLeftFrom(row.expires_at);
+  const daysLeft = computed != null
+    ? computed
+    : (row.days_left != null ? Number(row.days_left) : duration);
+  const isActive = row.active && daysLeft > 0;
   return {
     id: row.id,
     amount: Number(row.amount),
-    dailyProfit: Number(row.daily_profit),
+    dailyProfit: isActive ? Number(row.daily_profit) : 0,
     totalProfit: Number(row.total_profit),
     createdAt: row.created_at,
-    active: row.active,
-    durationDays: row.duration_days != null ? Number(row.duration_days) : durationFor(row.amount),
-    daysLeft: row.days_left != null ? Number(row.days_left) : durationFor(row.amount),
+    active: isActive,
+    status: isActive ? 'active' : 'completed',
+    durationDays: duration,
+    daysLeft: daysLeft,
+    expiresAt: row.expires_at,
+    progress: duration > 0
+      ? Math.min(100, Math.round(((duration - daysLeft) / duration) * 100))
+      : 0,
   };
 }
 
@@ -167,6 +252,7 @@ async function getUserWithPackages(userId) {
      JOIN packages p ON p.user_id = u.id WHERE u.referred_by = $1`,
     [user.referral_code]
   );
+  const shaped = pkgs.rows.map(shapePackage);
   return {
     id: user.id,
     name: user.name,
@@ -180,7 +266,8 @@ async function getUserWithPackages(userId) {
     milestoneBonus: Number(user.milestone_bonus || 0),
     invitedCount: Number(invited.rows[0].c || 0),
     activeReferrals: Number(activeRef.rows[0].c || 0),
-    packages: pkgs.rows.map(shapePackage),
+    packages: shaped,
+    activePackages: shaped.filter(p => p.active).length,
     createdAt: user.created_at,
   };
 }
@@ -235,7 +322,7 @@ async function payReferral(client, referredUserId, depositAmount) {
   if (referrerId === referredUserId) return;
 
   const commission = Number(depositAmount) * REFERRAL_RATE;
-  const cid = 'RE' + Date.now() + Math.floor(Math.random() * 1000);
+  const cid = makeId('RE');
   await client.query(
     `INSERT INTO referral_earnings (id, referrer_id, referred_id, deposit_amount, commission)
      VALUES ($1,$2,$3,$4,$5)`,
@@ -265,6 +352,25 @@ async function payReferral(client, referredUserId, depositAmount) {
 
   console.log(`Referral commission $${commission.toFixed(2)} paid to ${referrerId} for deposit ${depositAmount}`);
 }
+
+// ---- Create a package row (shared by /api/invest and the payment webhook) ----
+async function createPackage(client, userId, amount) {
+  const pkgId = makeId('PK');
+  const dur = durationFor(amount);
+  const r = await client.query(
+    `INSERT INTO packages
+       (id, user_id, amount, daily_profit, total_profit, active, duration_days, days_left, expires_at)
+     VALUES ($1,$2,$3,0,0,TRUE,$4,$4, NOW() + ($4 || ' days')::interval)
+     RETURNING *`,
+    [pkgId, userId, amount, dur]
+  );
+  return shapePackage(r.rows[0]);
+}
+
+// ---- Public: package catalogue (amount + duration) ----
+app.get('/api/packages', (req, res) => {
+  res.json(VALID_AMOUNTS.map(a => ({ amount: a, durationDays: durationFor(a) })));
+});
 
 // ---- Register ----
 app.post('/api/register', async (req, res) => {
@@ -388,6 +494,7 @@ app.post('/api/reset-password', async (req, res) => {
 // ---- Get profile ----
 app.get('/api/profile', auth, async (req, res) => {
   try {
+    await expireDuePackages();
     const user = await getUserWithPackages(req.userId);
     if (!user) return res.status(404).json({ error: 'Not found' });
     res.json(user);
@@ -432,21 +539,11 @@ app.get('/api/leaderboard', async (req, res) => {
 app.post('/api/invest', auth, async (req, res) => {
   try {
     const { amount } = req.body;
-    const validAmounts = [100, 250, 500, 1000, 2000, 5000, 10000, 25000];
-    if (!validAmounts.includes(amount))
+    if (!VALID_AMOUNTS.includes(Number(amount)))
       return res.status(400).json({ error: 'Invalid package amount' });
 
-    const pkgId = Date.now().toString();
-    const dur = durationFor(amount);
-    await pool.query(
-      `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active, duration_days, days_left)
-       VALUES ($1,$2,$3,0,0,TRUE,$4,$4)`,
-      [pkgId, req.userId, amount, dur]
-    );
-    res.json({
-      message: 'Package added',
-      package: { id: pkgId, amount, dailyProfit: 0, totalProfit: 0, active: true, durationDays: dur, daysLeft: dur },
-    });
+    const pkg = await createPackage(pool, req.userId, Number(amount));
+    res.json({ message: 'Package added', package: pkg });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
@@ -457,13 +554,12 @@ app.post('/api/invest', auth, async (req, res) => {
 app.post('/api/payment/create', auth, async (req, res) => {
   try {
     const { amount } = req.body;
-    const validAmounts = [100, 250, 500, 1000, 2000, 5000, 10000, 25000];
-    if (!validAmounts.includes(amount))
+    if (!VALID_AMOUNTS.includes(Number(amount)))
       return res.status(400).json({ error: 'Invalid package amount' });
     if (!NOWPAYMENTS_API_KEY)
       return res.status(500).json({ error: 'Payment not configured' });
 
-    const orderId = 'ORD' + Date.now() + Math.floor(Math.random() * 1000);
+    const orderId = makeId('ORD');
 
     await pool.query(
       `INSERT INTO payments (id, user_id, amount, status) VALUES ($1,$2,$3,'waiting')`,
@@ -481,7 +577,7 @@ app.post('/api/payment/create', auth, async (req, res) => {
         price_currency: 'usd',
         pay_currency: 'usdterc20',
         order_id: orderId,
-        order_description: `FX Pro Investment package $${amount}`,
+        order_description: `FX Pro Investment package $${amount} (${durationFor(amount)} days)`,
         ipn_callback_url: `${BACKEND_URL}/api/payment/webhook`,
       }),
     });
@@ -504,6 +600,7 @@ app.post('/api/payment/create', auth, async (req, res) => {
       pay_amount: data.pay_amount,
       pay_currency: data.pay_currency,
       price_amount: amount,
+      duration_days: durationFor(amount),
     });
   } catch (e) {
     console.error(e);
@@ -550,16 +647,13 @@ app.post('/api/payment/webhook', async (req, res) => {
         const p = await client.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [order_id]);
         if (p.rows.length && p.rows[0].status !== 'finished') {
           const pay = p.rows[0];
-          const pkgId = Date.now().toString();
-          const dur = durationFor(pay.amount);
-          await client.query(
-            `INSERT INTO packages (id, user_id, amount, daily_profit, total_profit, active, duration_days, days_left)
-             VALUES ($1,$2,$3,0,0,TRUE,$4,$4)`,
-            [pkgId, pay.user_id, pay.amount, dur]
-          );
+          const pkg = await createPackage(client, pay.user_id, Number(pay.amount));
           await client.query('UPDATE payments SET status = $1 WHERE id = $2', ['finished', order_id]);
           await payReferral(client, pay.user_id, Number(pay.amount));
-          console.log(`Payment ${order_id} finished, package activated for user ${pay.user_id}`);
+          console.log(
+            `Payment ${order_id} finished. Package ${pkg.id} ($${pkg.amount}) activated for user ${pay.user_id}, ` +
+            `runs ${pkg.durationDays} days, ends ${pkg.expiresAt}`
+          );
         }
         await client.query('COMMIT');
       } catch (err) {
@@ -580,23 +674,38 @@ app.post('/api/payment/webhook', async (req, res) => {
 });
 
 // ---- Distribute daily profit (admin) ----
-// Pays profit to active packages AND decreases days_left by 1 for ALL active
-// packages (counting every calendar day). Packages that reach 0 days are
-// automatically completed (active = FALSE).
+// Only packages that have NOT reached their end date get paid.
+// Expired packages are completed first, so they can never earn an extra day.
 app.post('/api/admin/distribute', async (req, res) => {
   try {
     const { adminKey, rate } = req.body;
     if (adminKey !== process.env.ADMIN_KEY)
       return res.status(403).json({ error: 'Forbidden' });
-    if (rate < 1.30 || rate > 5.00)
+
+    const r = Number(rate);
+    if (!isFinite(r) || r < 1.30 || r > 5.00)
       return res.status(400).json({ error: 'Invalid rate' });
 
     const client = await pool.connect();
+    let paidCount = 0;
+    let completedCount = 0;
+    let totalPaid = 0;
     try {
       await client.query('BEGIN');
-      const pkgs = await client.query('SELECT * FROM packages WHERE active = TRUE');
+
+      // 1) close out anything that has reached its end date
+      completedCount = await expireDuePackages(client);
+
+      // 2) pay only packages still inside their duration
+      const pkgs = await client.query(
+        `SELECT * FROM packages
+          WHERE active = TRUE
+            AND (expires_at IS NULL OR expires_at > NOW())
+          FOR UPDATE`
+      );
+
       for (const pkg of pkgs.rows) {
-        const profit = (Number(pkg.amount) * rate) / 100;
+        const profit = (Number(pkg.amount) * r) / 100;
         await client.query(
           'UPDATE packages SET daily_profit = $1, total_profit = total_profit + $1 WHERE id = $2',
           [profit, pkg.id]
@@ -605,7 +714,13 @@ app.post('/api/admin/distribute', async (req, res) => {
           'UPDATE users SET balance = balance + $1, total_profit = total_profit + $1 WHERE id = $2',
           [profit, pkg.user_id]
         );
+        paidCount++;
+        totalPaid += profit;
       }
+
+      // 3) refresh the display counter
+      await syncDaysLeft(client);
+
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
@@ -614,44 +729,58 @@ app.post('/api/admin/distribute', async (req, res) => {
       client.release();
     }
 
-    res.json({ message: `Profit distributed at ${rate}%` });
+    res.json({
+      message: `Profit distributed at ${r}%`,
+      packagesPaid: paidCount,
+      packagesCompleted: completedCount,
+      totalPaid: Number(totalPaid.toFixed(2)),
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// ---- Advance one calendar day (admin): decrement days_left for all active
-// packages and mark completed ones. Run this ONCE per day (every day,
-// including weekends). Separate from profit so counting stays on all 7 days. ----
+// ---- Expiry check (admin) ----
+// Kept for compatibility with the old admin panel button. It no longer
+// "counts down" a day by hand - it just closes out anything past its end date.
+// Durations now run off expires_at, so nothing breaks if this is never called.
 app.post('/api/admin/tick-day', async (req, res) => {
   try {
     const { adminKey } = req.body;
     if (adminKey !== process.env.ADMIN_KEY)
       return res.status(403).json({ error: 'Forbidden' });
 
-    const client = await pool.connect();
-    let completed = 0;
-    try {
-      await client.query('BEGIN');
-      // decrement, not below 0
-      await client.query(
-        `UPDATE packages SET days_left = GREATEST(days_left - 1, 0) WHERE active = TRUE`
-      );
-      // complete packages that hit 0
-      const done = await client.query(
-        `UPDATE packages SET active = FALSE WHERE active = TRUE AND days_left <= 0 RETURNING id`
-      );
-      completed = done.rows.length;
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    const completed = await expireDuePackages();
+    await syncDaysLeft();
 
-    res.json({ message: `Day advanced. ${completed} package(s) completed.` });
+    res.json({ message: `Expiry check done. ${completed} package(s) completed.` });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Package overview (admin) ----
+app.get('/api/admin/packages', async (req, res) => {
+  try {
+    const { adminKey } = req.query;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    await expireDuePackages();
+
+    const r = await pool.query(`
+      SELECT p.*, u.name AS user_name, u.email AS user_email
+        FROM packages p
+        LEFT JOIN users u ON u.id = p.user_id
+       ORDER BY p.created_at DESC
+    `);
+    res.json(r.rows.map(row => ({
+      ...shapePackage(row),
+      userName: row.user_name,
+      userEmail: row.user_email,
+    })));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
@@ -677,7 +806,7 @@ app.post('/api/withdraw', auth, async (req, res) => {
     if (amt > balance)
       return res.status(400).json({ error: 'Amount exceeds your available balance' });
 
-    const wid = 'WD' + Date.now() + Math.floor(Math.random() * 1000);
+    const wid = makeId('WD');
 
     const client = await pool.connect();
     try {
@@ -792,6 +921,8 @@ app.get('/api/admin/users', async (req, res) => {
     if (adminKey !== process.env.ADMIN_KEY)
       return res.status(403).json({ error: 'Forbidden' });
 
+    await expireDuePackages();
+
     const users = await pool.query('SELECT id FROM users ORDER BY created_at ASC');
     const result = [];
     for (const row of users.rows) {
@@ -817,9 +948,27 @@ function auth(req, res, next) {
   }
 }
 
+// ---- Background job: expire finished packages every hour ----
+// This is the safety net. Even if nobody opens the admin panel for a week,
+// packages still stop earning on the exact day they were meant to.
+function startExpiryJob() {
+  const run = async () => {
+    try {
+      const n = await expireDuePackages();
+      await syncDaysLeft();
+      if (n) console.log(`[expiry job] completed ${n} package(s)`);
+    } catch (e) {
+      console.error('[expiry job] failed:', e);
+    }
+  };
+  run();
+  setInterval(run, 60 * 60 * 1000); // every hour
+}
+
 // ---- Start server after DB is ready ----
 initDb()
   .then(() => {
+    startExpiryJob();
     app.listen(PORT, () => console.log(`FX Pro server running on port ${PORT}`));
   })
   .catch((err) => {
