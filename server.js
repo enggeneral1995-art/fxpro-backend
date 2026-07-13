@@ -1283,15 +1283,30 @@ async function runPayout({ position = null, force = false, mode = 'auto' } = {})
         FOR UPDATE`
     );
 
+    // ---- ONE rate per package tier, per day ----
+    // Pick the day's rate for each tier ONCE, up front. Every $100 package gets
+    // the same rate as every other $100 package today. Without this, two people
+    // who bought the same package on the same day see different profits, which
+    // looks broken even though the maths is fine.
+    const dayRates = {};
+    for (const amt of VALID_AMOUNTS) {
+      const cfg = settingsFor(amt);
+      const span = cfg.maxRate - cfg.minRate;
+      const frac = position !== null ? (position / 100) : Math.random();
+      dayRates[amt] = cfg.minRate + span * frac;
+    }
+
     let paidCount = 0;
     let totalPaid = 0;
     const breakdown = {};
 
     for (const pkg of pkgs.rows) {
-      const cfg = settingsFor(pkg.amount);
-      const span = cfg.maxRate - cfg.minRate;
-      const frac = position !== null ? (position / 100) : Math.random();
-      const r = cfg.minRate + span * frac;
+      const amt = Number(pkg.amount);
+      const cfg = settingsFor(amt);
+      // fall back for any package amount not in the catalogue
+      const r = dayRates[amt] !== undefined
+        ? dayRates[amt]
+        : cfg.minRate + (cfg.maxRate - cfg.minRate) * (position !== null ? position / 100 : Math.random());
       const profit = (Number(pkg.amount) * r) / 100;
 
       await client.query(
