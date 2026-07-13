@@ -31,6 +31,49 @@ const REFERRAL_MILESTONES = [
   { count: 15, bonus: 150 },
 ];
 
+// ---- Monthly competition ----
+// Ranked by the VOLUME each referrer brings in during the calendar month,
+// not by how many people they sign up. Volume-based keeps this a commission
+// scheme rather than a recruitment reward, and the cost is capped at the
+// prize pool below no matter how big the month gets.
+const COMPETITION_PRIZES = [
+  { rank: 1, prize: 500 },
+  { rank: 2, prize: 300 },
+  { rank: 3, prize: 150 },
+];
+const COMPETITION_MIN_VOLUME = 500; // must bring at least this much to place
+
+// ---- Points & tiers ----
+// Points are STATUS ONLY. They are never converted into cash or withdrawable
+// balance. That distinction is what keeps this a loyalty programme rather than
+// another payment for recruiting people.
+const POINTS_PER_DOLLAR_INVESTED = 1;   // $500 package  -> 500 pts
+const POINTS_PER_ACTIVE_REFERRAL = 250; // each invitee who actually invests
+const POINTS_PER_PACKAGE_OPENED  = 100; // one-off bonus for each new package
+
+const TIERS = [
+  { key: 'bronze',   name: 'Bronze',   min: 0,     icon: '🥉', color: '#CD7F32' },
+  { key: 'silver',   name: 'Silver',   min: 1000,  icon: '🥈', color: '#BEC8D7' },
+  { key: 'gold',     name: 'Gold',     min: 3000,  icon: '🥇', color: '#F5C842' },
+  { key: 'platinum', name: 'Platinum', min: 8000,  icon: '💎', color: '#5FE1E6' },
+  { key: 'diamond',  name: 'Diamond',  min: 20000, icon: '👑', color: '#B98CFF' },
+];
+
+function tierFor(points) {
+  let current = TIERS[0];
+  for (const t of TIERS) if (points >= t.min) current = t;
+  const idx = TIERS.findIndex(t => t.key === current.key);
+  const next = TIERS[idx + 1] || null;
+  return {
+    ...current,
+    next: next ? { name: next.name, icon: next.icon, min: next.min } : null,
+    pointsToNext: next ? Math.max(0, next.min - points) : 0,
+    progress: next
+      ? Math.min(100, Math.round(((points - current.min) / (next.min - current.min)) * 100))
+      : 100,
+  };
+}
+
 // ---- Default package catalogue ----
 // These are only the seed values. Once the server has run once, the real
 // numbers live in the package_settings table and are edited from the admin panel.
@@ -226,6 +269,20 @@ async function initDb() {
     );
   `);
 
+  // ---- Competition winners: one row per month per winner ----
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS competition_winners (
+      id          TEXT PRIMARY KEY,
+      month       TEXT NOT NULL,
+      user_id     TEXT REFERENCES users(id) ON DELETE CASCADE,
+      rank        INTEGER,
+      volume      NUMERIC,
+      prize       NUMERIC,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (month, rank)
+    );
+  `);
+
   console.log('Database tables ready');
 }
 
@@ -323,6 +380,17 @@ async function getUserWithPackages(userId) {
     [user.referral_code]
   );
   const shaped = pkgs.rows.map(shapePackage);
+
+  // ---- points (derived, never stored, never cash) ----
+  const realPkgs = pkgs.rows.filter(p => !p.is_test);
+  const investedTotal = realPkgs.reduce((a, p) => a + Number(p.amount), 0);
+  const activeRefCount = Number(activeRef.rows[0].c || 0);
+
+  const ptsInvested = Math.round(investedTotal * POINTS_PER_DOLLAR_INVESTED);
+  const ptsPackages = realPkgs.length * POINTS_PER_PACKAGE_OPENED;
+  const ptsReferral = activeRefCount * POINTS_PER_ACTIVE_REFERRAL;
+  const totalPoints = ptsInvested + ptsPackages + ptsReferral;
+
   return {
     id: user.id,
     name: user.name,
@@ -338,6 +406,19 @@ async function getUserWithPackages(userId) {
     activeReferrals: Number(activeRef.rows[0].c || 0),
     packages: shaped,
     activePackages: shaped.filter(p => p.active).length,
+    totalInvested: investedTotal,
+    points: {
+      total: totalPoints,
+      fromInvestment: ptsInvested,
+      fromPackages: ptsPackages,
+      fromReferrals: ptsReferral,
+      rules: {
+        perDollar: POINTS_PER_DOLLAR_INVESTED,
+        perPackage: POINTS_PER_PACKAGE_OPENED,
+        perReferral: POINTS_PER_ACTIVE_REFERRAL,
+      },
+    },
+    tier: tierFor(totalPoints),
     createdAt: user.created_at,
   };
 }
@@ -724,6 +805,187 @@ app.get('/api/referrals', auth, async (req, res) => {
     });
   } catch (e) {
     console.error('referrals failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
+});
+
+// ---- Monthly competition helpers ----
+function monthKey(d) {
+  return (d || new Date()).toISOString().slice(0, 7); // YYYY-MM
+}
+
+function monthEnd(d) {
+  const now = d || new Date();
+  // first instant of next month, in UTC
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+}
+
+// Volume each referrer brought in during a given month.
+async function competitionStandings(month) {
+  const m = month || monthKey();
+  const r = await pool.query(
+    `SELECT re.referrer_id AS id,
+            u.name,
+            SUM(re.deposit_amount) AS volume,
+            COUNT(DISTINCT re.referred_id) AS investors
+       FROM referral_earnings re
+       JOIN users u ON u.id = re.referrer_id
+      WHERE to_char(re.created_at, 'YYYY-MM') = $1
+      GROUP BY re.referrer_id, u.name
+     HAVING SUM(re.deposit_amount) >= $2
+      ORDER BY volume DESC, investors DESC
+      LIMIT 20`,
+    [m, COMPETITION_MIN_VOLUME]
+  );
+
+  return r.rows.map((row, i) => {
+    const name = (row.name || 'User').trim().split(/\s+/);
+    const display = name[0] + (name[1] ? ' ' + name[1][0] + '.' : '');
+    const prizeRow = COMPETITION_PRIZES.find(p => p.rank === i + 1);
+    return {
+      rank: i + 1,
+      userId: row.id,
+      name: display,
+      volume: Number(row.volume),
+      investors: Number(row.investors),
+      prize: prizeRow ? prizeRow.prize : 0,
+    };
+  });
+}
+
+// ---- Public/user: current month's competition ----
+app.get('/api/competition', async (req, res) => {
+  try {
+    const month = monthKey();
+    const standings = await competitionStandings(month);
+
+    // if the caller is logged in, tell them where they stand
+    let me = null;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const mine = standings.find(s => s.userId === decoded.id);
+        if (mine) {
+          me = { rank: mine.rank, volume: mine.volume, prize: mine.prize };
+        } else {
+          const v = await pool.query(
+            `SELECT COALESCE(SUM(deposit_amount),0) AS v
+               FROM referral_earnings
+              WHERE referrer_id = $1 AND to_char(created_at,'YYYY-MM') = $2`,
+            [decoded.id, month]
+          );
+          me = { rank: null, volume: Number(v.rows[0].v || 0), prize: 0 };
+        }
+      } catch (e) { /* not logged in - fine */ }
+    }
+
+    const endsAt = monthEnd();
+    const msLeft = endsAt.getTime() - Date.now();
+
+    res.json({
+      month,
+      prizes: COMPETITION_PRIZES,
+      minVolume: COMPETITION_MIN_VOLUME,
+      endsAt: endsAt.toISOString(),
+      daysLeft: Math.max(0, Math.ceil(msLeft / 86400000)),
+      standings: standings.map(({ userId, ...rest }) => rest), // don't expose user ids
+      me,
+    });
+  } catch (e) {
+    console.error('competition failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
+});
+
+// ---- Past winners ----
+app.get('/api/competition/winners', async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT w.month, w.rank, w.volume, w.prize, u.name
+         FROM competition_winners w
+         LEFT JOIN users u ON u.id = w.user_id
+        ORDER BY w.month DESC, w.rank ASC
+        LIMIT 30`
+    );
+    res.json(r.rows.map(row => {
+      const n = (row.name || 'User').trim().split(/\s+/);
+      return {
+        month: row.month,
+        rank: row.rank,
+        name: n[0] + (n[1] ? ' ' + n[1][0] + '.' : ''),
+        volume: Number(row.volume),
+        prize: Number(row.prize),
+      };
+    }));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Admin: settle a month and pay the winners ----
+// body: { adminKey, month }   month = 'YYYY-MM' (defaults to last month)
+// Safe to call twice: the UNIQUE(month, rank) key blocks a second payout.
+app.post('/api/admin/competition/settle', async (req, res) => {
+  try {
+    const { adminKey } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    let month = req.body.month;
+    if (!month) {
+      const d = new Date();
+      d.setUTCMonth(d.getUTCMonth() - 1);
+      month = monthKey(d);
+    }
+    if (!/^\d{4}-\d{2}$/.test(month))
+      return res.status(400).json({ error: 'Month must look like 2026-07' });
+
+    const already = await pool.query('SELECT 1 FROM competition_winners WHERE month = $1 LIMIT 1', [month]);
+    if (already.rows.length)
+      return res.status(409).json({ error: `${month} has already been settled. Nobody was paid twice.` });
+
+    const standings = await competitionStandings(month);
+    const winners = standings.slice(0, COMPETITION_PRIZES.length).filter(w => w.prize > 0);
+
+    if (!winners.length)
+      return res.status(400).json({ error: `No one qualified for ${month}.` });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const w of winners) {
+        await client.query(
+          `INSERT INTO competition_winners (id, month, user_id, rank, volume, prize)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [makeId('CW'), month, w.userId, w.rank, w.volume, w.prize]
+        );
+        await client.query(
+          `UPDATE users SET balance = balance + $1, milestone_bonus = milestone_bonus + $1
+            WHERE id = $2`,
+          [w.prize, w.userId]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const total = winners.reduce((a, w) => a + w.prize, 0);
+    console.log(`ADMIN settled competition ${month}: paid $${total} to ${winners.length} winner(s)`);
+
+    res.json({
+      message: `${month} settled — $${total} paid to ${winners.length} winner(s)`,
+      month,
+      totalPaid: total,
+      winners: winners.map(({ userId, ...rest }) => rest),
+    });
+  } catch (e) {
+    console.error('settle failed:', e);
     res.status(500).json({ error: 'Server error: ' + (e.message || e) });
   }
 });
