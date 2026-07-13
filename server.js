@@ -646,6 +646,88 @@ app.get('/api/profile', auth, async (req, res) => {
   }
 });
 
+// ---- My referrals (user) ----
+// Shows the person who they invited and what each one earned them.
+// Names and emails are partially masked: the referrer does not need the full
+// contact details of everyone in their downline, and the invitee did not agree
+// to share them.
+app.get('/api/referrals', auth, async (req, res) => {
+  try {
+    const me = await pool.query(
+      'SELECT referral_code, referral_earnings, milestone_bonus FROM users WHERE id = $1',
+      [req.userId]
+    );
+    if (!me.rows.length) return res.status(404).json({ error: 'Not found' });
+
+    const code = me.rows[0].referral_code;
+
+    // everyone who signed up with my code + what they have earned me
+    const r = await pool.query(
+      `SELECT u.id, u.name, u.email, u.created_at,
+              COUNT(DISTINCT p.id) FILTER (WHERE p.is_test = FALSE) AS pkg_count,
+              COALESCE(SUM(DISTINCT p.amount) FILTER (WHERE p.is_test = FALSE), 0) AS invested,
+              COALESCE((
+                SELECT SUM(re.commission) FROM referral_earnings re
+                 WHERE re.referrer_id = $2 AND re.referred_id = u.id
+              ), 0) AS commission
+         FROM users u
+         LEFT JOIN packages p ON p.user_id = u.id
+        WHERE u.referred_by = $1
+        GROUP BY u.id, u.name, u.email, u.created_at
+        ORDER BY u.created_at DESC`,
+      [code, req.userId]
+    );
+
+    const maskEmail = (e) => {
+      if (!e || !e.includes('@')) return '—';
+      const [a, b] = e.split('@');
+      const head = a.slice(0, 1);
+      return head + '•••@' + b;
+    };
+    const firstName = (n) => {
+      const t = (n || 'User').trim().split(/\s+/);
+      return t[0] + (t[1] ? ' ' + t[1][0] + '.' : '');
+    };
+
+    const list = r.rows.map(row => ({
+      name: firstName(row.name),
+      email: maskEmail(row.email),
+      joinedAt: row.created_at,
+      invested: Number(row.invested || 0),
+      hasInvested: Number(row.pkg_count || 0) > 0,
+      commission: Number(row.commission || 0),
+    }));
+
+    const activeCount = list.filter(x => x.hasInvested).length;
+
+    // what the next milestone is worth
+    let nextMilestone = null;
+    for (const m of REFERRAL_MILESTONES) {
+      if (activeCount < m.count) {
+        nextMilestone = { count: m.count, bonus: m.bonus, remaining: m.count - activeCount };
+        break;
+      }
+    }
+
+    res.json({
+      referralCode: code,
+      referralRate: REFERRAL_RATE * 100,
+      invitedCount: list.length,
+      activeCount,
+      totalCommission: Number(me.rows[0].referral_earnings || 0),
+      milestoneBonus: Number(me.rows[0].milestone_bonus || 0),
+      totalEarned:
+        Number(me.rows[0].referral_earnings || 0) + Number(me.rows[0].milestone_bonus || 0),
+      nextMilestone,
+      milestones: REFERRAL_MILESTONES,
+      referrals: list,
+    });
+  } catch (e) {
+    console.error('referrals failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
+});
+
 // ---- Leaderboard ----
 app.get('/api/leaderboard', async (req, res) => {
   try {
