@@ -212,6 +212,20 @@ async function initDb() {
     );
   }
 
+  // ---- Payout log: one row per calendar day. ----
+  // The UNIQUE primary key is what makes automatic payouts safe: if the job
+  // runs twice (restart, two instances, manual click), the second INSERT
+  // fails and nobody gets paid twice.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payout_log (
+      pay_date       DATE PRIMARY KEY,
+      packages_paid  INTEGER,
+      total_paid     NUMERIC,
+      mode           TEXT,
+      created_at     TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
   console.log('Database tables ready');
 }
 
@@ -872,22 +886,125 @@ app.post('/api/payment/webhook', async (req, res) => {
   }
 });
 
+// ---- Is today a trading day? Mon-Fri in UTC. ----
+function isTradingDay(d) {
+  const day = (d || new Date()).getUTCDay(); // 0 = Sun, 6 = Sat
+  return day >= 1 && day <= 5;
+}
+
+function todayKey(d) {
+  return (d || new Date()).toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
+
+// ---- THE payout engine. Used by both the automatic job and the admin button. ----
+// `position`: null  -> random rate inside each package's own band
+//             0-100 -> that point in each package's band
+// `force`:    admin override to pay even on a weekend / even if already paid today
+async function runPayout({ position = null, force = false, mode = 'auto' } = {}) {
+  const date = todayKey();
+
+  if (!force && !isTradingDay()) {
+    return { skipped: true, reason: 'weekend', date };
+  }
+
+  await loadPackageSettings();
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Claim today. If another run already claimed it, this throws and we bail
+    // out — that is the whole point. No double payouts, ever.
+    if (!force) {
+      try {
+        await client.query(
+          `INSERT INTO payout_log (pay_date, packages_paid, total_paid, mode)
+           VALUES ($1, 0, 0, $2)`,
+          [date, mode]
+        );
+      } catch (e) {
+        await client.query('ROLLBACK');
+        return { skipped: true, reason: 'already_paid_today', date };
+      }
+    }
+
+    // close out anything that reached its end date
+    const completed = await expireDuePackages(client);
+
+    // pay only packages still inside their duration
+    const pkgs = await client.query(
+      `SELECT * FROM packages
+        WHERE active = TRUE
+          AND (expires_at IS NULL OR expires_at > NOW())
+        FOR UPDATE`
+    );
+
+    let paidCount = 0;
+    let totalPaid = 0;
+    const breakdown = {};
+
+    for (const pkg of pkgs.rows) {
+      const cfg = settingsFor(pkg.amount);
+      const span = cfg.maxRate - cfg.minRate;
+      const frac = position !== null ? (position / 100) : Math.random();
+      const r = cfg.minRate + span * frac;
+      const profit = (Number(pkg.amount) * r) / 100;
+
+      await client.query(
+        'UPDATE packages SET daily_profit = $1, total_profit = total_profit + $1 WHERE id = $2',
+        [profit, pkg.id]
+      );
+      await client.query(
+        'UPDATE users SET balance = balance + $1, total_profit = total_profit + $1 WHERE id = $2',
+        [profit, pkg.user_id]
+      );
+
+      paidCount++;
+      totalPaid += profit;
+      const key = '$' + Number(pkg.amount);
+      breakdown[key] = breakdown[key] || { count: 0, rate: Number(r.toFixed(3)) };
+      breakdown[key].count++;
+    }
+
+    // record the real numbers
+    await client.query(
+      `INSERT INTO payout_log (pay_date, packages_paid, total_paid, mode)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (pay_date) DO UPDATE
+         SET packages_paid = $2, total_paid = $3, mode = $4`,
+      [date, paidCount, totalPaid, mode]
+    );
+
+    await syncDaysLeft(client);
+    await client.query('COMMIT');
+
+    console.log(`[payout ${mode}] ${date}: paid ${paidCount} package(s), $${totalPaid.toFixed(2)}, completed ${completed}`);
+
+    return {
+      skipped: false,
+      date,
+      packagesPaid: paidCount,
+      packagesCompleted: completed,
+      totalPaid: Number(totalPaid.toFixed(2)),
+      breakdown,
+      mode,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 // ---- Distribute daily profit (admin) ----
 // Only packages that have NOT reached their end date get paid.
 // Expired packages are completed first, so they can never earn an extra day.
 app.post('/api/admin/distribute', async (req, res) => {
   try {
-    const { adminKey, rate } = req.body;
+    const { adminKey, rate, force } = req.body;
     if (adminKey !== process.env.ADMIN_KEY)
       return res.status(403).json({ error: 'Forbidden' });
-
-    // `rate` is a percentage of each package's own min-max band:
-    //   0   = pay everyone their minimum rate
-    //   100 = pay everyone their maximum rate
-    //   50  = pay the middle of each band
-    // Omit `rate` entirely and each package gets a random value inside its band.
-    // Either way, a $100 package can never be paid a $25,000 package's rate.
-    await loadPackageSettings();
 
     let position = null;
     if (rate !== undefined && rate !== null && rate !== '') {
@@ -896,74 +1013,45 @@ app.post('/api/admin/distribute', async (req, res) => {
         return res.status(400).json({ error: 'Rate position must be between 0 and 100' });
     }
 
-    const client = await pool.connect();
-    let paidCount = 0;
-    let completedCount = 0;
-    let totalPaid = 0;
-    const breakdown = {};
-    try {
-      await client.query('BEGIN');
+    const result = await runPayout({ position, force: force === true, mode: 'manual' });
 
-      // 1) close out anything that has reached its end date
-      completedCount = await expireDuePackages(client);
-
-      // 2) pay only packages still inside their duration
-      const pkgs = await client.query(
-        `SELECT * FROM packages
-          WHERE active = TRUE
-            AND (expires_at IS NULL OR expires_at > NOW())
-          FOR UPDATE`
-      );
-
-      for (const pkg of pkgs.rows) {
-        const cfg = settingsFor(pkg.amount);
-        const span = cfg.maxRate - cfg.minRate;
-
-        // pick this package's rate from its OWN band
-        const frac = position !== null ? (position / 100) : Math.random();
-        const r = cfg.minRate + span * frac;
-
-        const profit = (Number(pkg.amount) * r) / 100;
-
-        await client.query(
-          'UPDATE packages SET daily_profit = $1, total_profit = total_profit + $1 WHERE id = $2',
-          [profit, pkg.id]
-        );
-        await client.query(
-          'UPDATE users SET balance = balance + $1, total_profit = total_profit + $1 WHERE id = $2',
-          [profit, pkg.user_id]
-        );
-
-        paidCount++;
-        totalPaid += profit;
-        const key = '$' + Number(pkg.amount);
-        breakdown[key] = breakdown[key] || { count: 0, rate: Number(r.toFixed(3)) };
-        breakdown[key].count++;
-      }
-
-      // 3) refresh the display counter
-      await syncDaysLeft(client);
-
-      await client.query('COMMIT');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
+    if (result.skipped) {
+      const why = result.reason === 'weekend'
+        ? 'Today is not a trading day (markets are closed Sat/Sun).'
+        : 'Profit has already been paid today. Nothing was paid twice.';
+      return res.status(409).json({ error: why, ...result });
     }
 
     res.json({
       message: position !== null
         ? `Profit distributed at ${position}% of each package's range`
         : `Profit distributed at a random rate inside each package's range`,
-      packagesPaid: paidCount,
-      packagesCompleted: completedCount,
-      totalPaid: Number(totalPaid.toFixed(2)),
-      breakdown,
+      ...result,
     });
   } catch (e) {
+    console.error('distribute failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
+});
+
+// ---- Payout history (admin) ----
+app.get('/api/admin/payouts', async (req, res) => {
+  try {
+    const { adminKey } = req.query;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+    const r = await pool.query(
+      `SELECT * FROM payout_log ORDER BY pay_date DESC LIMIT 60`
+    );
+    res.json(r.rows.map(row => ({
+      date: row.pay_date,
+      packagesPaid: Number(row.packages_paid || 0),
+      totalPaid: Number(row.total_paid || 0),
+      mode: row.mode,
+    })));
+  } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
   }
 });
 
@@ -1174,19 +1262,39 @@ function auth(req, res, next) {
   }
 }
 
-// ---- Background job: expire finished packages every hour ----
-// This is the safety net. Even if nobody opens the admin panel for a week,
-// packages still stop earning on the exact day they were meant to.
-function startExpiryJob() {
+// ---- Background jobs ----
+// Everything below runs on its own. Nobody has to remember to click anything.
+//
+// The daily payout is protected by the payout_log primary key, so running this
+// every hour is safe: the first successful run of the day claims the date and
+// every later attempt is a no-op. A missed hour, a restart, or a redeploy
+// cannot cause a double payment or a skipped day.
+function startBackgroundJobs() {
   const run = async () => {
+    // 1) close out packages that reached their end date
     try {
       const n = await expireDuePackages();
       await syncDaysLeft();
-      if (n) console.log(`[expiry job] completed ${n} package(s)`);
+      if (n) console.log(`[expiry] completed ${n} package(s)`);
     } catch (e) {
-      console.error('[expiry job] failed:', e);
+      console.error('[expiry] failed:', e);
+    }
+
+    // 2) pay today's profit, if it is a trading day and it has not been paid yet
+    try {
+      const r = await runPayout({ position: null, force: false, mode: 'auto' });
+      if (r.skipped && r.reason === 'already_paid_today') {
+        // normal: this is the expected result for 23 of the 24 hourly runs
+      } else if (r.skipped && r.reason === 'weekend') {
+        // normal: markets are closed
+      } else if (!r.skipped) {
+        console.log(`[payout] AUTO paid ${r.packagesPaid} package(s), $${r.totalPaid}`);
+      }
+    } catch (e) {
+      console.error('[payout] failed:', e);
     }
   };
+
   run();
   setInterval(run, 60 * 60 * 1000); // every hour
 }
@@ -1195,7 +1303,7 @@ function startExpiryJob() {
 initDb()
   .then(() => loadPackageSettings())
   .then(() => {
-    startExpiryJob();
+    startBackgroundJobs();
     app.listen(PORT, () => console.log(`FX Pro server running on port ${PORT}`));
   })
   .catch((err) => {
