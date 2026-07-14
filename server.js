@@ -25,7 +25,7 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const MAIL_FROM = 'FX Pro Investment <noreply@fxproinvestment.com>';
 
 // ---- Referral config ----
-const REFERRAL_RATE = 0.07; // 7% commission on every referred deposit (single level)
+const REFERRAL_RATE = 0.10; // 10% commission on every referred deposit (single level)
 const REFERRAL_MILESTONES = [
   { count: 5, bonus: 50 },
   { count: 10, bonus: 75 },
