@@ -7,6 +7,7 @@ const { Pool } = require('pg');
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', true); // Railway sits behind a proxy; needed for real client IPs
 app.use(cors());
 app.use(express.json());
 
@@ -123,6 +124,24 @@ function makeId(prefix) {
   return prefix + Date.now().toString(36) + crypto.randomBytes(4).toString('hex');
 }
 
+// ---- Client IP + country ----
+// Cloudflare / Railway pass the visitor's country in a header. We store it as-is;
+// no third-party lookup service is involved, so no data leaves our own stack.
+function clientIp(req) {
+  const xf = req.headers['x-forwarded-for'];
+  if (xf) return String(xf).split(',')[0].trim();
+  return req.ip || req.socket?.remoteAddress || null;
+}
+
+function clientCountry(req) {
+  return (
+    req.headers['cf-ipcountry'] ||
+    req.headers['x-vercel-ip-country'] ||
+    req.headers['x-country-code'] ||
+    null
+  );
+}
+
 // ---- PostgreSQL connection ----
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -177,6 +196,17 @@ async function initDb() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  // ---- Signup / login origin, for spotting one person running many accounts ----
+  // Stored so the admin can review suspicious clusters. Never shown to other users.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_ip TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_country TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_ip TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_country TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS device_id TEXT;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_signup_ip ON users(signup_ip);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_device ON users(device_id);`);
+
   // Columns for password reset codes
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_code TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_expires TIMESTAMPTZ;`);
@@ -282,6 +312,23 @@ async function initDb() {
       UNIQUE (month, rank)
     );
   `);
+
+  // ---- Withdrawal confirmation codes ----
+  // A withdrawal is only created once the code from the email is entered.
+  // Until then it lives here, not in `withdrawals`, and no balance has moved.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS withdraw_codes (
+      id         TEXT PRIMARY KEY,
+      user_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
+      amount     NUMERIC,
+      address    TEXT,
+      code       TEXT,
+      attempts   INTEGER DEFAULT 0,
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_wc_user ON withdraw_codes(user_id);`);
 
   console.log('Database tables ready');
 }
@@ -396,6 +443,12 @@ async function getUserWithPackages(userId) {
     name: user.name,
     email: user.email,
     phone: user.phone,
+    signupIp: user.signup_ip,
+    signupCountry: user.signup_country,
+    lastIp: user.last_ip,
+    lastCountry: user.last_country,
+    lastLogin: user.last_login,
+    deviceId: user.device_id,
     referralCode: user.referral_code,
     referredBy: user.referred_by,
     balance: Number(user.balance),
@@ -598,10 +651,13 @@ app.post('/api/admin/settings', async (req, res) => {
 // ---- Register ----
 app.post('/api/register', async (req, res) => {
   try {
-    const { name, email, phone, password, referralCode } = req.body;
+    const { name, email, phone, password, referralCode, deviceId } = req.body;
     const exists = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
     if (exists.rows.length)
       return res.status(400).json({ error: 'Email already exists' });
+
+    const ip = clientIp(req);
+    const country = clientCountry(req);
 
     const hash = await bcrypt.hash(password, 10);
     const id = Date.now().toString();
@@ -614,9 +670,11 @@ app.post('/api/register', async (req, res) => {
     }
 
     await pool.query(
-      `INSERT INTO users (id, name, email, phone, password, referral_code, referred_by, balance, total_profit)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,0,0)`,
-      [id, name, email, phone, hash, refCode, referredBy]
+      `INSERT INTO users
+         (id, name, email, phone, password, referral_code, referred_by, balance, total_profit,
+          signup_ip, signup_country, last_ip, last_country, last_login, device_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,0,0,$8,$9,$8,$9,NOW(),$10)`,
+      [id, name, email, phone, hash, refCode, referredBy, ip, country, deviceId || null]
     );
 
     const token = jwt.sign({ id }, JWT_SECRET);
@@ -636,6 +694,14 @@ app.post('/api/login', async (req, res) => {
     const user = r.rows[0];
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(400).json({ error: 'Wrong password' });
+
+    await pool.query(
+      `UPDATE users SET last_ip = $1, last_country = $2, last_login = NOW(),
+              device_id = COALESCE(device_id, $3)
+        WHERE id = $4`,
+      [clientIp(req), clientCountry(req), req.body.deviceId || null, user.id]
+    );
+
     const token = jwt.sign({ id: user.id }, JWT_SECRET);
     res.json({
       token,
@@ -1460,11 +1526,14 @@ app.get('/api/admin/packages', async (req, res) => {
   }
 });
 
-// ---- Request a withdrawal (user) ----
+// ---- Step 1: request a withdrawal -> email a confirmation code ----
+// Nothing is created and no balance moves here. If someone steals a session
+// token they still cannot move money without access to the email inbox.
 app.post('/api/withdraw', auth, async (req, res) => {
   try {
     const { amount, address } = req.body;
     const amt = Number(amount);
+
     if (!amt || amt < 30)
       return res.status(400).json({ error: 'Minimum withdrawal is $30' });
     if (!address || String(address).trim().length < 10)
@@ -1473,22 +1542,115 @@ app.post('/api/withdraw', auth, async (req, res) => {
     if (new Date().getUTCDay() !== 4)
       return res.status(400).json({ error: 'Withdrawals are only available on Thursdays (UTC).' });
 
-    const u = await pool.query('SELECT balance FROM users WHERE id = $1', [req.userId]);
+    const u = await pool.query('SELECT email, name, balance FROM users WHERE id = $1', [req.userId]);
     if (!u.rows.length) return res.status(404).json({ error: 'User not found' });
+
     const balance = Number(u.rows[0].balance);
     if (amt > balance)
       return res.status(400).json({ error: 'Amount exceeds your available balance' });
 
+    // one pending request at a time
+    await pool.query('DELETE FROM withdraw_codes WHERE user_id = $1', [req.userId]);
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const reqId = makeId('WC');
+    const expires = new Date(Date.now() + 15 * 60 * 1000);
+
+    await pool.query(
+      `INSERT INTO withdraw_codes (id, user_id, amount, address, code, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [reqId, req.userId, amt, String(address).trim(), code, expires]
+    );
+
+    const addr = String(address).trim();
+    const shortAddr = addr.slice(0, 8) + '...' + addr.slice(-6);
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #eee;border-radius:12px">
+        <h2 style="color:#0a1f44;margin:0 0 8px">FX Pro Investment</h2>
+        <p style="color:#333;font-size:15px">You requested a withdrawal. Use this code to confirm it:</p>
+        <div style="font-size:32px;font-weight:bold;letter-spacing:6px;color:#0a1f44;text-align:center;padding:16px 0">${code}</div>
+        <div style="background:#f7f8fa;border-radius:8px;padding:14px;margin:8px 0 16px">
+          <p style="margin:0 0 6px;color:#333;font-size:14px"><b>Amount:</b> $${amt.toFixed(2)}</p>
+          <p style="margin:0;color:#333;font-size:14px"><b>To:</b> ${shortAddr}</p>
+        </div>
+        <p style="color:#666;font-size:13px">This code expires in 15 minutes.</p>
+        <p style="color:#b91c1c;font-size:13px"><b>If you did not request this, someone may have access to your account. Change your password immediately.</b></p>
+      </div>`;
+
+    const sent = await sendEmail(u.rows[0].email, 'Confirm your FX Pro withdrawal', html);
+    if (!sent)
+      return res.status(502).json({ error: 'Could not send the confirmation email. Please try again.' });
+
+    const e = u.rows[0].email;
+    const masked = e.slice(0, 1) + '•••@' + e.split('@')[1];
+
+    res.json({
+      requiresCode: true,
+      requestId: reqId,
+      message: `We sent a 6-digit code to ${masked}. Enter it to confirm your withdrawal.`,
+      email: masked,
+    });
+  } catch (e) {
+    console.error('withdraw request failed:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Step 2: confirm with the emailed code -> the withdrawal is created ----
+app.post('/api/withdraw/confirm', auth, async (req, res) => {
+  try {
+    const { requestId, code } = req.body;
+    if (!requestId || !code)
+      return res.status(400).json({ error: 'Code is required' });
+
+    const r = await pool.query(
+      'SELECT * FROM withdraw_codes WHERE id = $1 AND user_id = $2',
+      [requestId, req.userId]
+    );
+    if (!r.rows.length)
+      return res.status(404).json({ error: 'This request no longer exists. Please start again.' });
+
+    const wc = r.rows[0];
+
+    if (new Date(wc.expires_at) < new Date()) {
+      await pool.query('DELETE FROM withdraw_codes WHERE id = $1', [requestId]);
+      return res.status(400).json({ error: 'The code has expired. Please start again.' });
+    }
+
+    if (Number(wc.attempts) >= 5) {
+      await pool.query('DELETE FROM withdraw_codes WHERE id = $1', [requestId]);
+      return res.status(429).json({ error: 'Too many wrong codes. Please start again.' });
+    }
+
+    if (String(wc.code) !== String(code).trim()) {
+      await pool.query('UPDATE withdraw_codes SET attempts = attempts + 1 WHERE id = $1', [requestId]);
+      const left = 5 - (Number(wc.attempts) + 1);
+      return res.status(400).json({ error: `Wrong code. ${left} attempt${left === 1 ? '' : 's'} left.` });
+    }
+
+    const amt = Number(wc.amount);
     const wid = makeId('WD');
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+
+      // re-check the balance now, not when the code was sent
+      const u = await client.query('SELECT balance FROM users WHERE id = $1 FOR UPDATE', [req.userId]);
+      const balance = Number(u.rows[0].balance);
+      if (amt > balance) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Amount exceeds your available balance' });
+      }
+
       await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [amt, req.userId]);
       await client.query(
-        `INSERT INTO withdrawals (id, user_id, amount, address, status) VALUES ($1,$2,$3,$4,'pending')`,
-        [wid, req.userId, amt, String(address).trim()]
+        `INSERT INTO withdrawals (id, user_id, amount, address, status)
+         VALUES ($1,$2,$3,$4,'pending')`,
+        [wid, req.userId, amt, wc.address]
       );
+      await client.query('DELETE FROM withdraw_codes WHERE id = $1', [requestId]);
       await client.query('COMMIT');
     } catch (err) {
       await client.query('ROLLBACK');
@@ -1497,12 +1659,14 @@ app.post('/api/withdraw', auth, async (req, res) => {
       client.release();
     }
 
+    console.log(`Withdrawal ${wid} confirmed by email for user ${req.userId} ($${amt})`);
+
     res.json({
-      message: 'Your withdrawal request has been submitted. Please allow up to 48 hours for it to be processed.',
+      message: 'Your withdrawal has been confirmed. Please allow up to 48 hours for it to be processed.',
       id: wid,
     });
   } catch (e) {
-    console.error(e);
+    console.error('withdraw confirm failed:', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1584,6 +1748,87 @@ app.post('/api/admin/withdraw/reject', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Duplicate-account detection (admin) ----
+// Groups accounts that share an IP or a device fingerprint. This flags clusters
+// for you to LOOK AT - it does not judge them. Families, offices, universities
+// and whole mobile carriers legitimately share an IP, so an automatic ban here
+// would lock out real customers. Read the cluster, then decide.
+app.get('/api/admin/fraud-check', async (req, res) => {
+  try {
+    const { adminKey } = req.query;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    // accounts sharing a signup IP
+    const byIp = await pool.query(`
+      SELECT u.signup_ip AS key,
+             COUNT(*) AS accounts,
+             json_agg(json_build_object(
+               'id', u.id, 'name', u.name, 'email', u.email,
+               'country', u.signup_country, 'createdAt', u.created_at,
+               'referredBy', u.referred_by,
+               'invested', COALESCE((
+                  SELECT SUM(p.amount) FROM packages p
+                   WHERE p.user_id = u.id AND p.is_test = FALSE), 0)
+             ) ORDER BY u.created_at) AS users
+        FROM users u
+       WHERE u.signup_ip IS NOT NULL
+       GROUP BY u.signup_ip
+      HAVING COUNT(*) > 1
+       ORDER BY COUNT(*) DESC
+       LIMIT 50
+    `);
+
+    // accounts sharing a device fingerprint (much stronger signal than IP)
+    const byDevice = await pool.query(`
+      SELECT u.device_id AS key,
+             COUNT(*) AS accounts,
+             json_agg(json_build_object(
+               'id', u.id, 'name', u.name, 'email', u.email,
+               'country', u.signup_country, 'createdAt', u.created_at,
+               'referredBy', u.referred_by,
+               'invested', COALESCE((
+                  SELECT SUM(p.amount) FROM packages p
+                   WHERE p.user_id = u.id AND p.is_test = FALSE), 0)
+             ) ORDER BY u.created_at) AS users
+        FROM users u
+       WHERE u.device_id IS NOT NULL AND u.device_id <> ''
+       GROUP BY u.device_id
+      HAVING COUNT(*) > 1
+       ORDER BY COUNT(*) DESC
+       LIMIT 50
+    `);
+
+    const shape = (rows, type) => rows.map(r => {
+      const users = r.users || [];
+      // the part that actually matters: is one of these accounts referring the others?
+      const codes = {};
+      users.forEach(u => { if (u.referredBy) codes[u.referredBy] = (codes[u.referredBy] || 0) + 1; });
+      const selfReferral = Object.values(codes).some(c => c > 0) && Object.keys(codes).length > 0;
+
+      return {
+        type,
+        key: r.key,
+        accounts: Number(r.accounts),
+        sharedReferrer: selfReferral ? Object.keys(codes)[0] : null,
+        users,
+      };
+    });
+
+    const ipClusters = shape(byIp.rows, 'ip');
+    const deviceClusters = shape(byDevice.rows, 'device');
+
+    res.json({
+      deviceClusters,   // strongest signal
+      ipClusters,       // weaker - can be a whole family or carrier
+      note: 'Shared IPs are common (families, offices, mobile carriers). Review before acting.',
+    });
+  } catch (e) {
+    console.error('fraud-check failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
   }
 });
 
