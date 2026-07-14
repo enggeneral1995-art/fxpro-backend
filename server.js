@@ -657,6 +657,30 @@ app.post('/api/admin/settings', async (req, res) => {
   }
 });
 
+// ---- Public: who owns a referral code? ----
+// Used for the "X invited you" banner on the landing page. Returns a first name
+// only - enough to make the invite feel personal, not enough to expose anyone.
+app.get('/api/referrer/:code', async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    if (!code) return res.status(400).json({ error: 'Missing code' });
+
+    const r = await pool.query(
+      'SELECT name FROM users WHERE referral_code = $1 AND suspended IS NOT TRUE',
+      [code]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Unknown code' });
+
+    const parts = (r.rows[0].name || 'A friend').trim().split(/\s+/);
+    const display = parts[0] + (parts[1] ? ' ' + parts[1][0] + '.' : '');
+
+    res.json({ name: display });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ---- Register ----
 app.post('/api/register', async (req, res) => {
   try {
