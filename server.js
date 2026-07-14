@@ -198,6 +198,13 @@ async function initDb() {
   `);
   // ---- Signup / login origin, for spotting one person running many accounts ----
   // Stored so the admin can review suspicious clusters. Never shown to other users.
+  // Suspension: a suspended account cannot log in, invest, or withdraw.
+  // Existing packages keep earning - suspending is not confiscation. If you
+  // need to stop a package too, delete it explicitly.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended BOOLEAN DEFAULT FALSE;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;`);
+
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_ip TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_country TEXT;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_ip TEXT;`);
@@ -443,6 +450,8 @@ async function getUserWithPackages(userId) {
     name: user.name,
     email: user.email,
     phone: user.phone,
+    suspended: !!user.suspended,
+    suspendedReason: user.suspended_reason,
     signupIp: user.signup_ip,
     signupCountry: user.signup_country,
     lastIp: user.last_ip,
@@ -694,6 +703,13 @@ app.post('/api/login', async (req, res) => {
     const user = r.rows[0];
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(400).json({ error: 'Wrong password' });
+
+    if (user.suspended) {
+      return res.status(403).json({
+        error: 'This account has been suspended. Please contact support.',
+        suspended: true,
+      });
+    }
 
     await pool.query(
       `UPDATE users SET last_ip = $1, last_country = $2, last_login = NOW(),
@@ -1832,6 +1848,43 @@ app.get('/api/admin/fraud-check', async (req, res) => {
   }
 });
 
+// ---- Suspend / unsuspend an account (admin) ----
+// body: { adminKey, userId, suspended, reason }
+app.post('/api/admin/user/suspend', async (req, res) => {
+  try {
+    const { adminKey, userId, suspended, reason } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    const on = suspended !== false;
+
+    const r = await pool.query(
+      `UPDATE users
+          SET suspended = $1,
+              suspended_reason = $2,
+              suspended_at = CASE WHEN $1 THEN NOW() ELSE NULL END
+        WHERE id = $3
+      RETURNING id, name, email, suspended`,
+      [on, on ? (reason || null) : null, userId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'User not found' });
+
+    const u = r.rows[0];
+    console.log(`ADMIN ${on ? 'SUSPENDED' : 'restored'} account ${u.email}${reason ? ' - ' + reason : ''}`);
+
+    res.json({
+      message: on
+        ? `${u.email} has been suspended. They can no longer log in.`
+        : `${u.email} has been restored.`,
+      user: { id: u.id, name: u.name, email: u.email, suspended: u.suspended },
+    });
+  } catch (e) {
+    console.error('suspend failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
+});
+
 // ---- Get all users (admin) ----
 app.get('/api/admin/users', async (req, res) => {
   try {
@@ -1860,10 +1913,23 @@ function auth(req, res, next) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.userId = decoded.id;
-    next();
   } catch {
-    res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: 'Invalid token' });
   }
+
+  // A token issued before the suspension would otherwise still work.
+  pool.query('SELECT suspended FROM users WHERE id = $1', [req.userId])
+    .then(r => {
+      if (!r.rows.length) return res.status(401).json({ error: 'Invalid token' });
+      if (r.rows[0].suspended) {
+        return res.status(403).json({
+          error: 'This account has been suspended. Please contact support.',
+          suspended: true,
+        });
+      }
+      next();
+    })
+    .catch(() => res.status(500).json({ error: 'Server error' }));
 }
 
 // ---- Background jobs ----
