@@ -1192,6 +1192,35 @@ app.post('/api/admin/grant-package', async (req, res) => {
   }
 });
 
+// ---- Mark a package as real / test (ADMIN ONLY) ----
+// For packages that were created with the test flag by mistake but are actually
+// real cash/office payments. Flipping to real makes them count in the leaderboard
+// and referral stats like any paid package.
+app.post('/api/admin/package/mark-real', async (req, res) => {
+  try {
+    const { adminKey, packageId, isTest } = req.body;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+    if (!packageId) return res.status(400).json({ error: 'packageId is required' });
+
+    const makeTest = isTest === true; // default: make it REAL
+    const r = await pool.query(
+      'UPDATE packages SET is_test = $1 WHERE id = $2 RETURNING id, amount, is_test',
+      [makeTest, packageId]
+    );
+    if (!r.rows.length) return res.status(404).json({ error: 'Package not found' });
+
+    console.log(`ADMIN marked package ${packageId} as ${makeTest ? 'TEST' : 'REAL'}`);
+    res.json({
+      message: makeTest ? 'Package marked as test' : 'Package marked as real',
+      package: { id: r.rows[0].id, amount: Number(r.rows[0].amount), isTest: r.rows[0].is_test },
+    });
+  } catch (e) {
+    console.error('mark-real failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
+});
+
 // ---- Delete a package (ADMIN ONLY) ----
 // Handy for cleaning up test packages when you are done.
 // This does NOT claw back profit already added to the user's balance.
