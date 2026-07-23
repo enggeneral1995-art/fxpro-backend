@@ -344,6 +344,31 @@ async function initDb() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_wc_user ON withdraw_codes(user_id);`);
 
+  // ---- migrations table ----
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_meta (
+      key        TEXT PRIMARY KEY,
+      value      TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // One-time: push the new default rates into package_settings.
+  // Guarded by a marker row so it runs once and never overwrites later admin edits.
+  const mk = await pool.query(`SELECT 1 FROM app_meta WHERE key = 'rates_v2' LIMIT 1`);
+  if (!mk.rows.length) {
+    for (const d of DEFAULT_PACKAGES) {
+      await pool.query(
+        `UPDATE package_settings
+            SET min_rate = $2, max_rate = $3, duration_days = $4, updated_at = NOW()
+          WHERE amount = $1`,
+        [d.amount, d.min, d.max, d.days]
+      );
+    }
+    await pool.query(`INSERT INTO app_meta (key, value) VALUES ('rates_v2', 'applied')`);
+    console.log('Migration: applied new package rates (10% reduction) to package_settings');
+  }
+
   console.log('Database tables ready');
 }
 
