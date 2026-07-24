@@ -193,6 +193,7 @@ async function initDb() {
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_id TEXT;`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS pay_address TEXT;`);
   await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS pay_amount TEXT;`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS actually_paid NUMERIC;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS withdrawals (
       id         TEXT PRIMARY KEY,
@@ -1389,19 +1390,72 @@ app.post('/api/payment/webhook', async (req, res) => {
 
     const { order_id, payment_status } = req.body;
 
+    // NOWPayments reports what the customer ACTUALLY sent. Without checking it,
+    // someone could request a $100 invoice, send $10, and still be credited the
+    // full package. Never trust payment_status alone.
+    const actuallyPaid = Number(req.body.actually_paid);
+    const expectedPay  = Number(req.body.pay_amount);
+    const ipnPrice     = Number(req.body.price_amount);
+
+    if (!order_id) return res.json({ ok: true });
+
+    // record what arrived, for the admin view
+    await pool.query(
+      `UPDATE payments SET actually_paid = $1 WHERE id = $2`,
+      [isFinite(actuallyPaid) ? actuallyPaid : null, order_id]
+    ).catch(() => {});
+
     if (payment_status === 'finished' || payment_status === 'confirmed') {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
         const p = await client.query('SELECT * FROM payments WHERE id = $1 FOR UPDATE', [order_id]);
+
         if (p.rows.length && p.rows[0].status !== 'finished') {
           const pay = p.rows[0];
-          const pkg = await createPackage(client, pay.user_id, Number(pay.amount));
+          const ordered = Number(pay.amount);              // what we invoiced, in USD
+          const expected = isFinite(expectedPay) ? expectedPay
+                          : Number(pay.pay_amount);        // what we asked for, in USDT
+
+          // ---- underpayment guard ----
+          // 1% tolerance absorbs rounding and tiny network differences only.
+          let underpaid = false;
+          let reason = '';
+
+          if (isFinite(actuallyPaid) && isFinite(expected) && expected > 0) {
+            if (actuallyPaid < expected * 0.99) {
+              underpaid = true;
+              reason = `sent ${actuallyPaid} of ${expected} USDT`;
+            }
+          }
+          // second check against the USD price, in case pay_amount is missing
+          if (!underpaid && isFinite(ipnPrice) && ipnPrice > 0 && ipnPrice < ordered * 0.99) {
+            underpaid = true;
+            reason = `price_amount ${ipnPrice} below ordered ${ordered}`;
+          }
+          // if we cannot verify the amount at all, do NOT activate
+          if (!isFinite(actuallyPaid) && !isFinite(ipnPrice)) {
+            underpaid = true;
+            reason = 'no amount reported by the payment provider';
+          }
+
+          if (underpaid) {
+            await client.query(
+              'UPDATE payments SET status = $1 WHERE id = $2',
+              ['underpaid', order_id]
+            );
+            await client.query('COMMIT');
+            console.warn(`BLOCKED underpaid order ${order_id} for user ${pay.user_id}: ${reason}`);
+            return res.json({ ok: true, blocked: 'underpaid' });
+          }
+
+          // amount verified -> activate the package the customer actually paid for
+          const pkg = await createPackage(client, pay.user_id, ordered);
           await client.query('UPDATE payments SET status = $1 WHERE id = $2', ['finished', order_id]);
-          await payReferral(client, pay.user_id, Number(pay.amount));
+          await payReferral(client, pay.user_id, ordered);
           console.log(
-            `Payment ${order_id} finished. Package ${pkg.id} ($${pkg.amount}) activated for user ${pay.user_id}, ` +
-            `runs ${pkg.durationDays} days, ends ${pkg.expiresAt}`
+            `Payment ${order_id} verified (${actuallyPaid}/${expected} USDT). ` +
+            `Package ${pkg.id} ($${pkg.amount}) activated for user ${pay.user_id}.`
           );
         }
         await client.query('COMMIT');
@@ -1411,7 +1465,7 @@ app.post('/api/payment/webhook', async (req, res) => {
       } finally {
         client.release();
       }
-    } else if (order_id) {
+    } else {
       await pool.query('UPDATE payments SET status = $1 WHERE id = $2', [payment_status, order_id]);
     }
 
@@ -2099,6 +2153,40 @@ app.post('/api/admin/user/suspend', async (req, res) => {
     });
   } catch (e) {
     console.error('suspend failed:', e);
+    res.status(500).json({ error: 'Server error: ' + (e.message || e) });
+  }
+});
+
+// ---- Payments list (admin) ----
+// Shows what was invoiced vs what actually arrived, so underpayments are visible
+// instead of silently activating a package.
+app.get('/api/admin/payments', async (req, res) => {
+  try {
+    const { adminKey } = req.query;
+    if (adminKey !== process.env.ADMIN_KEY)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    const r = await pool.query(`
+      SELECT p.id, p.amount, p.pay_amount, p.actually_paid, p.status, p.created_at,
+             u.name AS user_name, u.email AS user_email
+        FROM payments p
+        LEFT JOIN users u ON u.id = p.user_id
+       ORDER BY p.created_at DESC
+       LIMIT 100
+    `);
+
+    res.json(r.rows.map(row => ({
+      id: row.id,
+      ordered: Number(row.amount),
+      expected: row.pay_amount ? Number(row.pay_amount) : null,
+      received: row.actually_paid != null ? Number(row.actually_paid) : null,
+      status: row.status,
+      createdAt: row.created_at,
+      userName: row.user_name,
+      userEmail: row.user_email,
+    })));
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: 'Server error: ' + (e.message || e) });
   }
 });
