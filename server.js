@@ -26,11 +26,12 @@ const MAIL_FROM = 'FX Pro Investment <noreply@fxproinvestment.com>';
 
 // ---- Referral config ----
 // ---- Referral model ----
-// Single level only. The referrer earns an ongoing share of the DAILY PROFIT
-// their invitee is paid - not a cut of the invitee's money. The invitee is paid
-// exactly the same rate as anyone else; this comes out of the company margin.
-// This is the same shape as a forex introducing-broker rebate.
-const REFERRAL_DEPOSIT_RATE = 0.00; // no one-off commission on deposits
+// Single level only. Two parts, both paid out of the company margin:
+//   1. 10% of the deposit, once, when the package activates.
+//   2. 10% of every daily profit the invitee is paid, for the package term.
+// The invitee is paid exactly the same rate as anyone else - nothing is taken
+// from them. This is the same shape as a forex introducing-broker rebate.
+const REFERRAL_DEPOSIT_RATE = 0.10; // 10% one-off on the deposit, paid the moment the package activates
 const REFERRAL_PROFIT_SHARE = 0.10; // 10% of each daily profit paid to an invitee
 const REFERRAL_RATE = REFERRAL_DEPOSIT_RATE; // kept for existing code paths
 const REFERRAL_MILESTONES = [
